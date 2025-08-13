@@ -1,18 +1,24 @@
 [project]
 name = "wfm"
 version = "0.1.0"
-description = ""
+description = "Wave Foundation Model - A PyTorch-based foundation model with spherical mesh, differential equations, and multi-modal input processing"
 authors = [
     {name = "Davide Riva",email = "60431521+dave-shore@users.noreply.github.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "matplotlib>=3.7.0",
+    "scipy>=1.11.0",
+    "librosa>=0.10.0"
 ]
 
 [tool.poetry]
 packages = [{include = "wfm", from = "src"}]
-
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

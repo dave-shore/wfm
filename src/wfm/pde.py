@@ -6,11 +6,17 @@ differential equations over spherical meshes.
 """
 
 import torch
+from torch._dynamo.polyfills import NoEnterTorchFunctionMode
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Callable, Union, Dict, Any
-import math
+import numpy as np
 from .spherical_mesh import SphericalMesh
+from .functional import FitzhughNagumo
+
+REACTION_FUNCTIONS = {
+    "fitzhugh-nagumo": FitzhughNagumo, 
+}
 
 
 class DiffusionAdvectionReaction:
@@ -18,7 +24,7 @@ class DiffusionAdvectionReaction:
     A class representing a diffusion-advection-reaction differential equation.
     
     The general form is:
-    ∂u/∂t = ∇·(D∇u) - ∇·(vu) + R(u)
+    ∂u/∂t = ∇·(D∇u) - ∇·(Au) + R(u)
     
     Where:
     - u is the field variable
@@ -29,9 +35,10 @@ class DiffusionAdvectionReaction:
     
     def __init__(
         self,
-        diffusion_coeff: Union[float, torch.Tensor, Callable] = 1.0,
-        velocity_field: Optional[Union[torch.Tensor, Callable]] = None,
-        reaction_function: Optional[Callable] = None,
+        diffusion_matrix: Union[float, torch.Tensor, Callable] = 1.0,
+        advection_matrix: Optional[Union[torch.Tensor, Callable]] = None,
+        reaction_function: Optional[Union[Callable, str]] = None,
+        reaction_function_kwargs: Dict[str, Union[float, np.ndarray, torch.Tensor]] = None,
         boundary_conditions: Optional[Dict[str, Any]] = None,
         mesh: Optional[SphericalMesh] = None
     ):
@@ -45,8 +52,8 @@ class DiffusionAdvectionReaction:
             boundary_conditions: Dictionary of boundary conditions
             mesh: Spherical mesh for discretization
         """
-        self.diffusion_coeff = diffusion_coeff
-        self.velocity_field = velocity_field
+        self.diffusion_matrix = diffusion_matrix
+        self.advection_matrix = advection_matrix
         self.reaction_function = reaction_function
         self.boundary_conditions = boundary_conditions or {}
         self.mesh = mesh

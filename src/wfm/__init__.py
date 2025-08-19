@@ -1,51 +1,21 @@
 """
-Wave Foundation Model (WFM) Package
+Wave Foundation Model - A PyTorch-based foundation model with spherical mesh, 
+differential equations, and enhanced multi-modal input processing.
 
-A PyTorch-based foundation model with spherical mesh, differential equations, and multi-modal input processing.
+This package provides:
+- Spherical mesh generation and coordinate transformations
+- Diffusion-advection-reaction differential equation solvers
+- Advanced multi-modal input processing with binary tokenization
+- Peripheral view summarization for tabular and graph data
 """
 
-__version__ = "0.1.0"
-__author__ = "Davide Riva"
-
-# Core components
-from .spherical_mesh import SphericalMesh, SphericalMeshBuilder
-from .diffusion_advection_reaction import (
-    DiffusionAdvectionReaction, 
-    SphericalDiscretizer,
-    ReactionFunctions,
-    VelocityFields
-)
-from .input_processor import (
-    InputProcessor,
-    ImageProcessor,
-    TextProcessor,
-    NumericalProcessor,
-    AudioProcessor,
-    VideoProcessor,
-    GraphProcessor,
-    BatchProcessor,
-    InputValidator
-)
+__version__ = "0.2.0"
+__author__ = "Wave Foundation Model Team"
 
 __all__ = [
-    # Spherical mesh
-    "SphericalMesh",
-    "SphericalMeshBuilder",
-    
-    # Differential equations
-    "DiffusionAdvectionReaction",
-    "SphericalDiscretizer", 
-    "ReactionFunctions",
-    "VelocityFields",
-    
-    # Input processing
-    "InputProcessor",
-    "ImageProcessor",
-    "TextProcessor",
-    "NumericalProcessor",
-    "AudioProcessor",
-    "VideoProcessor",
-    "GraphProcessor",
-    "BatchProcessor",
-    "InputValidator",
+    "base",
+    "functional",
+    "input_processor",
+    "pde",
+    "spherical_mesh"
 ]

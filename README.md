@@ -1,380 +1,261 @@
 # Wave Foundation Model (WFM)
 
-A PyTorch-based foundation model package that implements a novel approach to multi-modal AI through spherical geometry and differential equations.
-
-## Overview
-
-The Wave Foundation Model (WFM) is a unique foundation model architecture that combines:
-
-1. **3D Spherical Mesh Generation** - Creates collision-free spherical meshes for geometric computations
-2. **Diffusion-Advection-Reaction Equations** - Implements PDEs over spherical domains with numerical discretization
-3. **Multi-Modal Input Processing** - Converts diverse input types into standardized 12×12×3 tensor sequences
+A PyTorch-based foundation model with spherical mesh, differential equations, and **enhanced multi-modal input processing** with binary tokenization and peripheral view summarization.
 
 ## Key Features
 
-- **Collision Avoidance**: Automatically excludes center and pole regions to prevent numerical instabilities
-- **Coordinate Transformations**: Seamless conversion between Cartesian and spherical coordinate systems
-- **Flexible PDE Framework**: Support for various reaction functions and velocity fields
-- **Multi-Modal Inputs**: Handles images, text, numerical data, audio, and graphs
-- **GPU Acceleration**: Full PyTorch compatibility with CUDA support
-- **Extensible Architecture**: Modular design for easy customization and extension
+- **Spherical Mesh Generation**: 3D spherical mesh with coordinate transformations and collision avoidance
+- **Differential Equation Solver**: Diffusion-advection-reaction equations on spherical meshes
+- **Enhanced Multi-Modal Input Processing**: 
+  - **Binary Tokenization**: SentencePiece-like tokenizer with hierarchical clustering and binary encoding
+  - **Peripheral View Summarization**: Row/column summaries for tabular data, neighbor/node summaries for graphs
+  - **Advanced Audio Processing**: MFCC features with stereo support
+  - **Video Processing**: Parallel image and audio stream processing
+- **Unified Tensor Representation**: All data types converted to `(12, 13, 3)` tensors with data type encoding
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.12+
-- PyTorch 2.0+
-- Poetry (for dependency management)
-
-### Install Dependencies
-
 ```bash
-# Install using Poetry
+# Clone the repository
+git clone <repository-url>
+cd wfm
+
+# Install dependencies
 poetry install
 
-# Or install manually
-pip install torch numpy Pillow opencv-python matplotlib scipy
-```
-
-### Install Package
-
-```bash
-# Development install
-poetry install
-
-# Or install in development mode
+# Or install with pip
 pip install -e .
 ```
 
 ## Quick Start
 
-### 1. Spherical Mesh Creation
+### 1. Spherical Mesh Generation
 
 ```python
 from wfm import SphericalMesh, SphericalMeshBuilder
 
-# Create a basic spherical mesh
-mesh = SphericalMesh(
-    radius=1.0,
-    n_lat=64,      # Number of latitude bands
-    n_lon=128,     # Number of longitude points
-    exclude_poles=True,
-    pole_exclusion_angle=0.1,
-    center_exclusion_radius=0.05
-)
+# Create a uniform spherical mesh
+mesh = SphericalMesh(radius=1.0, n_lat=64, n_lon=128)
 
-# Get mesh coordinates
-cartesian_coords = mesh.get_mesh_points()
-spherical_coords = mesh.get_spherical_coords()
-
-# Use builder for predefined configurations
+# Or use predefined mesh types
+adaptive_mesh = SphericalMeshBuilder.create_adaptive_mesh()
 high_res_mesh = SphericalMeshBuilder.create_high_resolution_mesh()
+
+# Transform coordinates
+cartesian_points = mesh.cartesian_coordinates
+spherical_points = mesh.spherical_coordinates
 ```
 
 ### 2. Differential Equations
 
 ```python
-from wfm import (
-    DiffusionAdvectionReaction, 
-    SphericalDiscretizer,
-    ReactionFunctions,
-    VelocityFields
+from wfm import DiffusionAdvectionReaction, SphericalDiscretizer
+
+# Define a DAR equation
+dar = DiffusionAdvectionReaction(
+    diffusion_coeff=1.0,
+    velocity_field=lambda x: torch.tensor([0.1, 0.0, 0.0]),
+    reaction_function=lambda x: -0.1 * x
 )
 
-# Define a diffusion-advection-reaction equation
-equation = DiffusionAdvectionReaction(
-    diffusion_coeff=0.1,
-    velocity_field=VelocityFields.solid_body_rotation,
-    reaction_function=ReactionFunctions.logistic_growth
-)
-
-# Set the mesh
-equation.set_mesh(mesh)
-
-# Create discretizer and solve
+# Discretize and solve
 discretizer = SphericalDiscretizer(mesh, time_step=0.01)
-solution = discretizer.discretize_equation(
-    equation=equation,
-    initial_condition=initial_condition,
-    time_steps=100,
-    method='explicit_euler'
-)
+solution = discretizer.discretize_equation(dar, initial_condition, time_steps=100)
 ```
 
-### 3. Input Processing
+### 3. Enhanced Input Processing
 
 ```python
-from wfm import InputProcessor, BatchProcessor
+from wfm import InputProcessor, BinaryTokenizer
 
-# Create input processor for 12×12×3 tensors
+# Initialize processor with binary tokenization
 processor = InputProcessor(target_shape=(12, 12, 3))
 
-# Process different input types
-numerical_tensor = processor.process_input([1.0, 2.0, 3.0], 'numerical')
-text_tensor = processor.process_input("Hello, World!", 'text')
-image_tensor = processor.process_input("path/to/image.jpg", 'image')
-
-# Batch processing
-batch_processor = BatchProcessor(processor)
-batch_tensor = batch_processor.process_batch([
-    [1.0, 2.0, 3.0],
-    "Sample text",
-    {"nodes": [0, 1, 2], "edges": [[0, 1], [1, 2]]}
-])
+# Process different data types
+text_tensor = processor.process_input("Hello, world!")  # Binary tokenization
+tabular_tensor = processor.process_input(pd.DataFrame(...))  # Peripheral views
+graph_tensor = processor.process_input(nx.Graph(...))  # Neighbor summaries
+image_tensor = processor.process_input(image_array)  # RGB processing
+audio_tensor = processor.process_input(audio_array)  # MFCC features
 ```
 
 ## Architecture
 
 ### Core Components
 
-#### SphericalMesh
-- **Purpose**: Generates and manages 3D spherical meshes
-- **Features**: 
-  - Automatic pole and center exclusion
-  - Coordinate system transformations
-  - Validity checking for collision avoidance
-  - Configurable resolution and exclusion parameters
+1. **SphericalMesh**: Generates and manages 3D spherical meshes
+2. **DiffusionAdvectionReaction**: Defines and solves PDEs on spherical domains
+3. **InputProcessor**: Main orchestrator for multi-modal data processing
 
-#### DiffusionAdvectionReaction
-- **Purpose**: Defines and solves PDEs over spherical domains
-- **Features**:
-  - Support for variable diffusion coefficients
-  - Customizable velocity fields
-  - Flexible reaction functions
-  - Spherical coordinate-aware discretization
+### Specialized Processors
 
-#### InputProcessor
-- **Purpose**: Converts diverse inputs to standardized tensor format
-- **Features**:
-  - Multi-modal input support (image, text, numerical, audio, graph)
-  - Automatic input type detection
-  - Batch processing capabilities
-  - Configurable output dimensions
+- **ImageProcessor**: RGB pixel processing with focal/peripheral view concept
+- **AudioProcessor**: MFCC feature extraction with stereo support
+- **VideoProcessor**: Parallel frame and audio stream processing
+- **TextProcessor**: Binary tokenization with hierarchical clustering
+- **NumericalProcessor**: Text-based representation with statistical summaries
+- **TabularProcessor**: Text-like encoding with row/column peripheral summaries
+- **GraphProcessor**: Tabular conversion with neighbor/node attribute summaries
 
-### Coordinate Systems
+### Binary Tokenization
 
-The package uses two coordinate systems:
+The `BinaryTokenizer` mimics SentencePiece with:
+- **Hierarchical Clustering**: Organizes tokens using Ward clustering on embeddings
+- **Binary Encoding**: Tokens encoded as binary vectors stored as base-10 integers
+- **L² Dimension**: Binary dimension equals focus patch size (12² = 144)
+- **Proximity Preservation**: Similar tokens get similar binary codes
 
-1. **Cartesian (x, y, z)**: Standard 3D coordinates
-2. **Spherical (r, θ, φ)**: 
-   - r: Radial distance from center
-   - θ: Colatitude (0 to π)
-   - φ: Longitude (0 to 2π)
+### Peripheral View Summarization
 
-### Mesh Generation
+- **Tabular Data**: 
+  - Left view: Row summary statistics (mean, std, min, max)
+  - Right view: Column summary statistics
+- **Graph Data**:
+  - Left view: Neighbor summaries (count, degree stats)
+  - Right view: Node attribute summaries
 
-The spherical mesh is generated by:
-1. Creating latitude and longitude grids
-2. Excluding regions near poles (configurable angle)
-3. Excluding center region (configurable radius)
-4. Converting to Cartesian coordinates
-5. Providing coordinate transformation utilities
+## Data Type Encoding
+
+Each processed tensor includes a `(12, 1, 3)` data type column:
+- **Image/Text/Numerical**: `[1, 0, 0]` (text-like types)
+- **Audio**: `[0, 1, 0]` (audio type)
+- **Video**: `[0, 0, 1]` (video type)
+
+## Tensor Structure
+
+The unified tensor structure is `(sequence_length, height, width+1, channels)` where:
+- `height = 12`: Standard height dimension
+- `width+1`: Includes data type column + peripheral views + main content
+- `channels = 3`: RGB/feature channels
+
+For data with peripheral views:
+```
+[Data Type | Left Peripheral | Main Content | Right Peripheral]
+[   (1)    |      (1)       |     (11)     |      (1)      ]
+```
 
 ## Advanced Usage
 
-### Custom Reaction Functions
+### Specialized Input Processing
+
+#### Text with Binary Tokenization
 
 ```python
-def custom_reaction(u, coords, param1=1.0, param2=0.5):
-    """Custom reaction function R(u) = param1 * u^2 - param2 * u"""
-    return param1 * u**2 - param2 * u
+from wfm import BinaryTokenizer
 
-equation = DiffusionAdvectionReaction(
-    reaction_function=custom_reaction
+# Initialize with a real multilingual tokenizer
+tokenizer = BinaryTokenizer(
+    base_tokenizer=your_pretrained_tokenizer,
+    vocab_size=8192,
+    binary_dim=144  # 12²
 )
+
+# Process text
+binary_codes = tokenizer.encode("Sample text")
+text_matrix = tokenizer.get_binary_matrix("Sample text")
 ```
 
-### Custom Velocity Fields
+#### Tabular Data with Peripheral Views
 
 ```python
-def custom_velocity(coords, strength=1.0):
-    """Custom velocity field"""
-    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
-    vx = strength * torch.sin(y)
-    vy = strength * torch.cos(x)
-    vz = torch.zeros_like(x)
-    return torch.stack([vx, vy, vz], dim=1)
+from wfm import TabularProcessor
 
-equation = DiffusionAdvectionReaction(
-    velocity_field=custom_velocity
-)
+processor = TabularProcessor(target_shape=(12, 12, 3))
+df = pd.DataFrame({
+    'feature1': [1.2, 3.4, 5.6],
+    'feature2': [2.1, 4.3, 6.5]
+})
+
+# Creates tensor with row/column summaries in peripheral views
+tensor = processor.process(df)
 ```
 
-### Adaptive Mesh Generation
+#### Graph Data with Neighbor Summaries
 
 ```python
-# Create adaptive mesh based on solution gradients
-def create_adaptive_mesh(solution, base_mesh):
-    # Implementation for mesh refinement based on solution features
-    pass
+from wfm import GraphProcessor
+
+processor = GraphProcessor(target_shape=(12, 12, 3))
+G = nx.Graph()
+G.add_edges_from([(0, 1), (1, 2), (2, 0)])
+
+# Creates tensor with neighbor and node attribute summaries
+tensor = processor.process(G)
 ```
 
 ## Examples
 
-### Complete Pipeline Example
-
-```python
-from wfm import *
-
-# 1. Create mesh
-mesh = SphericalMeshBuilder.create_uniform_mesh(n_lat=32, n_lon=64)
-
-# 2. Define equation
-equation = DiffusionAdvectionReaction(
-    diffusion_coeff=0.05,
-    velocity_field=VelocityFields.zonal_flow,
-    reaction_function=ReactionFunctions.cubic_reaction
-)
-
-# 3. Process input
-processor = InputProcessor(target_shape=(12, 12, 3))
-input_tensor = processor.process_input([0.1, 0.2, 0.3, 0.4, 0.5])
-
-# 4. Solve equation
-discretizer = SphericalDiscretizer(mesh, time_step=0.01)
-solution = discretizer.discretize_equation(
-    equation=equation,
-    initial_condition=initial_condition,
-    time_steps=50
-)
-
-# 5. Analyze results
-final_state = solution[-1]
-print(f"Final solution range: [{final_state.min():.3f}, {final_state.max():.3f}]")
-```
-
-### Visualization Example
-
-```python
-import matplotlib.pyplot as plt
-
-# Visualize solution evolution
-coords = mesh.get_mesh_points()
-x, y = coords[:, 0], coords[:, 1]
-
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-# Initial condition
-scatter0 = axes[0].scatter(x, y, c=solution[0], cmap='viridis', s=10)
-axes[0].set_title('Initial Condition')
-
-# Middle time
-mid_time = solution.shape[0] // 2
-scatter1 = axes[1].scatter(x, y, c=solution[mid_time], cmap='viridis', s=10)
-axes[1].set_title(f'Time Step {mid_time}')
-
-# Final time
-scatter2 = axes[2].scatter(x, y, c=solution[-1], cmap='viridis', s=10)
-axes[2].set_title('Final Time')
-
-plt.tight_layout()
-plt.show()
-```
-
-## Performance Considerations
-
-### GPU Acceleration
-- All tensors are automatically moved to GPU if available
-- Use `device` parameter to control tensor placement
-- Batch processing for efficient GPU utilization
-
-### Memory Management
-- Mesh generation scales with O(n_lat × n_lon)
-- Solution storage scales with O(time_steps × n_points)
-- Use `max_sequence_length` to limit memory usage
-
-### Numerical Stability
-- Pole exclusion prevents coordinate singularities
-- Center exclusion avoids division by zero
-- Configurable exclusion parameters for different applications
-
-## Extending the Package
-
-### Adding New Input Types
-
-```python
-class CustomProcessor:
-    def __init__(self, target_shape, device):
-        self.target_shape = target_shape
-        self.device = device
-    
-    def process(self, custom_input):
-        # Custom processing logic
-        return processed_tensor
-
-# Register with InputProcessor
-processor.custom_processor = CustomProcessor(processor.target_shape, processor.device)
-```
-
-### Adding New Reaction Functions
-
-```python
-class CustomReactionFunctions:
-    @staticmethod
-    def new_reaction(u, coords, **params):
-        # Custom reaction implementation
-        return reaction_result
-
-# Use in equation
-equation = DiffusionAdvectionReaction(
-    reaction_function=CustomReactionFunctions.new_reaction
-)
-```
-
-## Testing
-
-Run the demonstration script to verify installation:
+Run the comprehensive demo:
 
 ```bash
 python examples/foundation_model_demo.py
 ```
 
-This will:
-1. Create spherical meshes
-2. Solve differential equations
-3. Process various input types
-4. Generate visualizations
-5. Demonstrate integration
+This demonstrates:
+- Spherical mesh generation
+- DAR equation solving
+- All input processors with new features
+- Visualization of tensor structures and peripheral views
+
+## Performance Considerations
+
+- **Binary Tokenization**: Efficient integer-based storage vs. one-hot encoding
+- **Peripheral Views**: Compact summarization reduces memory footprint
+- **Hierarchical Clustering**: Pre-computed token organization for fast lookup
+- **Batch Processing**: Support for processing multiple inputs simultaneously
+
+## Extending the Package
+
+### Adding New Data Types
+
+1. Create a new processor class inheriting from base processors
+2. Implement the `process()` method
+3. Add peripheral view summarization if needed
+4. Update `InputProcessor._is_*()` methods
+
+### Custom Binary Tokenization
+
+```python
+class CustomTokenizer(BinaryTokenizer):
+    def _create_binary_code(self, cluster_id, token_pos, num_clusters):
+        # Implement custom binary encoding logic
+        pass
+```
+
+## Testing
+
+```bash
+# Run tests
+python -m pytest tests/
+
+# Run specific test
+python -m pytest tests/test_input_processor.py -v
+```
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
+3. Implement your changes
+4. Add tests
 5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Citation
 
-If you use this package in your research, please cite:
-
 ```bibtex
 @software{wfm2024,
-  title={Wave Foundation Model: A PyTorch-based foundation model with spherical geometry},
-  author={Davide Riva},
+  title={Wave Foundation Model: A PyTorch-based foundation model with spherical mesh and enhanced multi-modal processing},
+  author={Wave Foundation Model Team},
   year={2024},
-  url={https://github.com/dave-shore/wfm}
+  url={https://github.com/your-repo/wfm}
 }
 ```
 
-## Support
-
-For questions and support:
-- Open an issue on GitHub
-- Check the examples directory
-- Review the inline documentation
-
 ## Roadmap
 
-- [ ] Advanced mesh refinement algorithms
-- [ ] Implicit time integration methods
-- [ ] Parallel processing support
-- [ ] More sophisticated input encodings
-- [ ] Integration with popular ML frameworks
-- [ ] Pre-trained model weights
-- [ ] Web interface for interactive exploration
+- [ ] Integration with real multilingual tokenizers (HuggingFace, SentencePiece)
+- [ ] Advanced peripheral view algorithms (attention-based summarization)
+- [ ] Performance benchmarking suite
+- [ ] Additional visualization tools
+- [ ] GPU acceleration for large-scale processing
+- [ ] Pre-trained models and embeddings

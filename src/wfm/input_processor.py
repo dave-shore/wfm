@@ -17,6 +17,10 @@ import re
 from pathlib import Path
 import librosa
 import warnings
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
+import networkx as nx
 
 # Suppress librosa warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='librosa')
@@ -34,114 +38,101 @@ DATA_TYPES = {
 
 class InputProcessor:
     """
-    Main class for processing various input types into standardized tensor sequences.
+    Main input processor that handles various data types and converts them to
+    sequences of tensors with data type encoding and peripheral view summarization.
     
-    This processor converts inputs into sequences of 12x12x3 dimensional tensors,
-    with an additional (12,1,3) column prepended for one-hot encoded data type indication.
+    The output tensor has shape (sequence_length, height, width+1, channels) where:
+    - width+1 includes the data type column and peripheral views
+    - Left peripheral view: neighbor/row summaries
+    - Main content: processed data
+    - Right peripheral view: node attributes/column summaries
     """
     
-    def __init__(
-        self,
-        target_shape: Tuple[int, int, int] = (12, 12, 3),
-        max_sequence_length: Optional[int] = None,
-        device: Optional[torch.device] = None
-    ):
+    def __init__(self, target_shape: Tuple[int, int, int] = (12, 12, 3), device: Optional[torch.device] = None):
         """
         Initialize the input processor.
         
         Args:
             target_shape: Target tensor shape (height, width, channels)
-            max_sequence_length: Maximum length of output sequences
-            device: PyTorch device for tensor operations
+            device: PyTorch device (defaults to CPU)
         """
         self.target_shape = target_shape
-        self.max_sequence_length = max_sequence_length
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device or torch.device('cpu')
         
         # Initialize specialized processors
-        self.image_processor = ImageProcessor(target_shape, device)
-        self.text_processor = TextProcessor(target_shape, device)
-        self.numerical_processor = NumericalProcessor(target_shape, device)
-        self.audio_processor = AudioProcessor(target_shape, device)
-        self.video_processor = VideoProcessor(target_shape, device)
-        self.graph_processor = GraphProcessor(target_shape, device)
+        self.image_processor = ImageProcessor(target_shape, self.device)
+        self.audio_processor = AudioProcessor(target_shape, self.device)
+        self.video_processor = VideoProcessor(target_shape, self.device)
         
-    def process_input(
-        self,
-        input_data: Any,
-        input_type: Optional[str] = None
-    ) -> torch.Tensor:
+        # Initialize text-based processors with shared tokenizer
+        self.binary_tokenizer = BinaryTokenizer(
+            base_tokenizer=None,  # Will create mock tokenizer
+            vocab_size=4096,
+            binary_dim=144  # 12² for focus patch size
+        )
+        self.text_processor = TextProcessor(target_shape, self.device, self.binary_tokenizer)
+        self.numerical_processor = NumericalProcessor(target_shape, self.device, self.binary_tokenizer)
+        self.tabular_processor = TabularProcessor(target_shape, self.device, self.binary_tokenizer)
+        self.graph_processor = GraphProcessor(target_shape, self.device, self.binary_tokenizer)
+    
+    def process_input(self, input_data: Any) -> torch.Tensor:
         """
-        Process input data into a sequence of tensors.
+        Process input data to tensor sequence.
         
         Args:
-            input_data: Input data of any supported type
-            input_type: Optional hint about input type
+            input_data: Input data of various types
             
         Returns:
-            Tensor sequence of shape (sequence_length, height, width+1, channels)
-            where the first column contains one-hot encoded data type information
+            Tensor of shape (sequence_length, height, width+1, channels)
         """
-        # Auto-detect input type if not provided
-        if input_type is None:
-            input_type = self._detect_input_type(input_data)
-        
-        # Process based on detected type
-        if input_type == 'image':
-            return self.image_processor.process(input_data)
-        elif input_type == 'text':
-            return self.text_processor.process(input_data)
-        elif input_type == 'numerical':
-            return self.numerical_processor.process(input_data)
-        elif input_type == 'audio':
-            return self.audio_processor.process(input_data)
-        elif input_type == 'video':
+        # Determine input type and process accordingly
+        if self._is_image(input_data):
+            return self.image_processor.process(input_data).unsqueeze(0)
+        elif self._is_audio(input_data):
+            return self.audio_processor.process(input_data).unsqueeze(0)
+        elif self._is_video(input_data):
             return self.video_processor.process(input_data)
-        elif input_type == 'graph':
-            return self.graph_processor.process(input_data)
-        elif input_type == 'mixed':
-            return self._process_mixed_input(input_data)
+        elif self._is_text(input_data):
+            return self.text_processor.process(input_data).unsqueeze(0)
+        elif self._is_numerical(input_data):
+            return self.numerical_processor.process(input_data).unsqueeze(0)
+        elif self._is_tabular(input_data):
+            return self.tabular_processor.process(input_data).unsqueeze(0)
+        elif self._is_graph(input_data):
+            return self.graph_processor.process(input_data).unsqueeze(0)
         else:
-            raise ValueError(f"Unsupported input type: {input_type}")
+            raise ValueError(f"Unsupported input type: {type(input_data)}")
     
-    def _detect_input_type(self, input_data: Any) -> str:
-        """Auto-detect the type of input data."""
-        if isinstance(input_data, (str, list)) and all(isinstance(x, str) for x in input_data if isinstance(input_data, list)):
-            return 'text'
-        elif isinstance(input_data, (np.ndarray, torch.Tensor)) and len(input_data.shape) >= 2:
-            return 'image'
-        elif isinstance(input_data, (int, float, np.number)) or (isinstance(input_data, (list, np.ndarray, torch.Tensor)) and all(isinstance(x, (int, float, np.number)) for x in input_data)):
-            return 'numerical'
-        elif isinstance(input_data, dict) and 'nodes' in input_data and 'edges' in input_data:
-            return 'graph'
-        elif isinstance(input_data, (list, tuple)) and len(input_data) > 0:
-            # Mixed input types
-            return 'mixed'
-        else:
-            # Default to numerical for unknown types
-            return 'numerical'
+    def _is_image(self, data: Any) -> bool:
+        """Check if data is image-like."""
+        return (isinstance(data, (str, np.ndarray, torch.Tensor)) and 
+                (isinstance(data, str) and data.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')) or
+                 isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) >= 2))
     
-    def _process_mixed_input(self, input_data: Sequence) -> torch.Tensor:
-        """Process mixed input types by concatenating their representations."""
-        processed_sequences = []
-        
-        for item in input_data:
-            item_type = self._detect_input_type(item)
-            if item_type == 'image':
-                seq = self.image_processor.process(item)
-            elif item_type == 'text':
-                seq = self.text_processor.process(item)
-            elif item_type == 'numerical':
-                seq = self.numerical_processor.process(item)
-            elif item_type == 'graph':
-                seq = self.graph_processor.process(item)
-            else:
-                seq = self.numerical_processor.process(item)
-            
-            processed_sequences.append(seq)
-        
-        # Concatenate sequences along sequence dimension
-        return torch.cat(processed_sequences, dim=0)
+    def _is_audio(self, data: Any) -> bool:
+        """Check if data is audio-like."""
+        return (isinstance(data, str) and data.lower().endswith(('.wav', '.mp3', '.flac', '.ogg')) or
+                isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) == 1)
+    
+    def _is_video(self, data: Any) -> bool:
+        """Check if data is video-like."""
+        return isinstance(data, str) and data.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+    
+    def _is_text(self, data: Any) -> bool:
+        """Check if data is text-like."""
+        return isinstance(data, str) and not any(data.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.wav', '.mp3', '.flac', '.ogg', '.mp4', '.avi', '.mov', '.mkv'])
+    
+    def _is_numerical(self, data: Any) -> bool:
+        """Check if data is numerical-like."""
+        return isinstance(data, (int, float, np.number, np.ndarray, torch.Tensor, list)) and not self._is_image(data)
+    
+    def _is_tabular(self, data: Any) -> bool:
+        """Check if data is tabular-like."""
+        return isinstance(data, pd.DataFrame) or (isinstance(data, np.ndarray) and len(data.shape) == 2)
+    
+    def _is_graph(self, data: Any) -> bool:
+        """Check if data is graph-like."""
+        return isinstance(data, nx.Graph) or (isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)))
 
 
 class ImageProcessor:
@@ -237,120 +228,312 @@ class ImageProcessor:
         return result
 
 
+class BinaryTokenizer:
+    """
+    A binary tokenizer that mimics SentencePiece with hierarchical clustering.
+    Tokens are encoded as binary vectors stored as base-10 integers.
+    """
+    
+    def __init__(self, base_tokenizer, vocab_size: int = 4096, binary_dim: int = 144):
+        """
+        Initialize the binary tokenizer.
+        
+        Args:
+            base_tokenizer: A pre-trained multilingual tokenizer (e.g., from transformers)
+            vocab_size: Maximum vocabulary size for the binary tokenizer
+            binary_dim: Dimension of binary vectors (should be L² where L is focus patch size)
+        """
+        self.base_tokenizer = base_tokenizer
+        self.vocab_size = vocab_size
+        self.binary_dim = binary_dim
+        self.token_to_binary = {}
+        self.binary_to_token = {}
+        self.token_embeddings = None
+        self.cluster_labels = None
+        self._build_binary_vocabulary()
+    
+    def _build_binary_vocabulary(self):
+        """Build binary vocabulary using hierarchical clustering on base tokenizer embeddings."""
+        # Get embeddings from base tokenizer
+        if hasattr(self.base_tokenizer, 'get_vocab'):
+            vocab = list(self.base_tokenizer.get_vocab().keys())[:self.vocab_size]
+        else:
+            vocab = list(self.base_tokenizer.vocab.keys())[:self.vocab_size]
+        
+        # Get embeddings (simplified - in practice you'd use the actual embedding matrix)
+        embeddings = self._get_embeddings(vocab)
+        
+        # Perform hierarchical clustering
+        clustering = AgglomerativeClustering(
+            n_clusters=min(self.vocab_size, len(vocab)),
+            linkage='ward'
+        )
+        cluster_labels = clustering.fit_predict(embeddings)
+        
+        # Assign binary codes based on clustering
+        self._assign_binary_codes(vocab, cluster_labels)
+    
+    def _get_embeddings(self, vocab: List[str]) -> np.ndarray:
+        """Get embeddings for vocabulary tokens."""
+        # Simplified embedding generation - in practice use actual tokenizer embeddings
+        np.random.seed(42)  # For reproducibility
+        embeddings = np.random.randn(len(vocab), 768)  # Standard embedding dimension
+        return embeddings
+    
+    def _assign_binary_codes(self, vocab: List[str], cluster_labels: np.ndarray):
+        """Assign binary codes to tokens based on clustering."""
+        unique_clusters = np.unique(cluster_labels)
+        
+        for i, token in enumerate(vocab):
+            cluster_id = cluster_labels[i]
+            
+            # Create binary code based on cluster position and token position
+            binary_code = self._create_binary_code(cluster_id, i, len(unique_clusters))
+            
+            # Convert binary to base-10 integer
+            integer_code = int(''.join(map(str, binary_code)), 2)
+            
+            self.token_to_binary[token] = integer_code
+            self.binary_to_token[integer_code] = token
+    
+    def _create_binary_code(self, cluster_id: int, token_pos: int, num_clusters: int) -> List[int]:
+        """Create binary code for a token."""
+        # Use cluster_id and token_pos to create a unique binary representation
+        # This is a simplified approach - in practice you'd want more sophisticated encoding
+        
+        # Ensure binary_dim is a perfect square for L² representation
+        L = int(np.sqrt(self.binary_dim))
+        if L * L != self.binary_dim:
+            L = int(np.sqrt(self.binary_dim))
+            self.binary_dim = L * L
+        
+        # Create binary code
+        binary = [0] * self.binary_dim
+        
+        # Use cluster_id and token_pos to set bits
+        cluster_bits = min(8, L)  # Use first L bits for cluster
+        token_bits = min(8, L)    # Use next L bits for token position
+        
+        # Set cluster bits
+        for i in range(cluster_bits):
+            if cluster_id & (1 << i):
+                binary[i] = 1
+        
+        # Set token position bits
+        for i in range(token_bits):
+            if token_pos & (1 << i):
+                binary[L + i] = 1
+        
+        return binary
+    
+    def encode(self, text: str) -> List[int]:
+        """Encode text to list of binary integer codes."""
+        # Tokenize with base tokenizer
+        if hasattr(self.base_tokenizer, 'encode'):
+            tokens = self.base_tokenizer.encode(text)
+        else:
+            tokens = self.base_tokenizer.tokenize(text)
+        
+        # Convert to binary codes
+        binary_codes = []
+        for token in tokens:
+            if token in self.token_to_binary:
+                binary_codes.append(self.token_to_binary[token])
+            else:
+                # Handle unknown tokens with a default code
+                binary_codes.append(0)
+        
+        return binary_codes
+    
+    def decode(self, binary_codes: List[int]) -> str:
+        """Decode binary integer codes back to text."""
+        tokens = []
+        for code in binary_codes:
+            if code in self.binary_to_token:
+                tokens.append(self.binary_to_token[code])
+            else:
+                tokens.append('<UNK>')
+        
+        # Join tokens back to text
+        if hasattr(self.base_tokenizer, 'decode'):
+            return self.base_tokenizer.decode(tokens)
+        else:
+            return ' '.join(tokens)
+    
+    def get_binary_matrix(self, text: str) -> torch.Tensor:
+        """Get binary matrix representation of text."""
+        binary_codes = self.encode(text)
+        
+        # Convert to binary matrix
+        matrix = torch.zeros(len(binary_codes), self.binary_dim, dtype=torch.float32)
+        
+        for i, code in enumerate(binary_codes):
+            # Convert integer back to binary
+            binary_str = format(code, f'0{self.binary_dim}b')
+            for j, bit in enumerate(binary_str):
+                matrix[i, j] = float(bit)
+        
+        return matrix
+
 class TextProcessor:
-    """Processor for text inputs."""
+    """
+    Processes text data using binary tokenization.
+    """
     
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device):
-        self.target_shape = target_shape
+    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
+        """
+        Initialize text processor.
+        
+        Args:
+            target_shape: Target tensor shape (height, width, channels)
+            device: PyTorch device
+            tokenizer: Optional pre-initialized binary tokenizer
+        """
+        self.target_height, self.target_width, self.target_channels = target_shape
         self.device = device
-        self.vocab_size = 1000  # Simplified vocabulary size
         
-    def process(self, text_input: Union[str, List[str]]) -> torch.Tensor:
-        """Process text input into tensor sequence."""
-        if isinstance(text_input, str):
-            texts = [text_input]
+        # Initialize default tokenizer if none provided
+        if tokenizer is None:
+            # Create a mock tokenizer for demonstration
+            # In practice, you'd load a real multilingual tokenizer
+            self.tokenizer = self._create_mock_tokenizer()
         else:
-            texts = text_input
-        
-        # Process each text into a tensor
-        tensors = []
-        for text in texts:
-            tensor = self._text_to_tensor(text)
-            tensors.append(tensor)
-        
-        # Stack into sequence
-        return torch.stack(tensors, dim=0)
+            self.tokenizer = tokenizer
     
-    def _text_to_tensor(self, text: str) -> torch.Tensor:
-        """Convert text to tensor representation."""
-        target_height, target_width, target_channels = self.target_shape
+    def _create_mock_tokenizer(self) -> BinaryTokenizer:
+        """Create a mock tokenizer for demonstration purposes."""
+        class MockTokenizer:
+            def __init__(self):
+                self.vocab = {f"token_{i}": i for i in range(1000)}
+            
+            def get_vocab(self):
+                return self.vocab
         
-        # Simple character-based encoding
-        # Convert text to numerical representation
-        char_indices = [ord(c) % self.vocab_size for c in text[:target_height * target_width]]
+        return BinaryTokenizer(MockTokenizer())
+    
+    def process(self, text_input: Union[str, List[str]]) -> torch.Tensor:
+        """
+        Process text input to target tensor shape.
         
-        # Pad or truncate to fit target dimensions
-        if len(char_indices) < target_height * target_width:
-            char_indices.extend([0] * (target_height * target_width - len(char_indices)))
-        else:
-            char_indices = char_indices[:target_height * target_width]
+        Args:
+            text_input: Text string or list of strings
+            
+        Returns:
+            Tensor of shape (target_height, target_width+1, target_channels)
+        """
+        if isinstance(text_input, str):
+            text_input = [text_input]
+        
+        # Get binary matrix from tokenizer
+        binary_matrix = self.tokenizer.get_binary_matrix(' '.join(text_input))
         
         # Reshape to target dimensions
-        char_tensor = torch.tensor(char_indices, dtype=torch.float32, device=self.device)
-        char_tensor = char_tensor.view(target_height, target_width)
+        tensor = self._reshape_to_target(binary_matrix)
         
-        # Normalize to [0, 1]
-        char_tensor = char_tensor / self.vocab_size
+        # Add data type column
+        tensor = self._add_data_type_column(tensor, 'text')
         
-        # Expand to 3 channels
-        char_tensor = char_tensor.unsqueeze(-1).expand(-1, -1, target_channels)
+        return tensor.to(self.device)
+    
+    def _reshape_to_target(self, binary_matrix: torch.Tensor) -> torch.Tensor:
+        """Reshape binary matrix to target dimensions."""
+        # Flatten binary matrix
+        flat_binary = binary_matrix.flatten()
         
-        # Add one-hot encoded data type column
-        return self._add_data_type_column(char_tensor, 'text')
+        # Pad or truncate to fit target dimensions
+        target_size = self.target_height * self.target_width * self.target_channels
+        
+        if len(flat_binary) < target_size:
+            # Pad with zeros
+            padding = torch.zeros(target_size - len(flat_binary))
+            flat_binary = torch.cat([flat_binary, padding])
+        else:
+            # Truncate
+            flat_binary = flat_binary[:target_size]
+        
+        # Reshape to target dimensions
+        tensor = flat_binary.reshape(self.target_height, self.target_width, self.target_channels)
+        
+        return tensor
     
     def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
-        """Add one-hot encoded data type column to the left of the tensor."""
-        one_hot = torch.tensor(DATA_TYPES[data_type], dtype=torch.float32, device=self.device)
-        one_hot = one_hot.unsqueeze(0).expand(12, -1)
-        one_hot = one_hot.unsqueeze(1)
-        result = torch.cat([one_hot, tensor], dim=1)
+        """Add data type column to tensor."""
+        # Create data type column (12, 1, 3)
+        data_type_col = torch.zeros(self.target_height, 1, self.target_channels)
+        
+        # Set one-hot encoding for text
+        data_type_col[:, 0, 0] = 1.0  # Text type
+        
+        # Concatenate with original tensor
+        result = torch.cat([data_type_col, tensor], dim=1)
+        
         return result
 
 
 class NumericalProcessor:
-    """Processor for numerical inputs."""
+    """
+    Processes numerical data using binary tokenization.
+    """
     
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device):
-        self.target_shape = target_shape
+    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
+        """
+        Initialize numerical processor.
+        
+        Args:
+            target_shape: Target tensor shape (height, width, channels)
+            device: PyTorch device
+            tokenizer: Optional binary tokenizer for text processing
+        """
+        self.target_height, self.target_width, self.target_channels = target_shape
         self.device = device
         
-    def process(self, numerical_input: Union[float, int, np.number, List, np.ndarray, torch.Tensor]) -> torch.Tensor:
-        """Process numerical input into tensor sequence."""
-        # Convert to list if single value
-        if isinstance(numerical_input, (int, float, np.number)):
-            values = [float(numerical_input)]
-        elif isinstance(numerical_input, torch.Tensor):
-            values = numerical_input.flatten().cpu().numpy().tolist()
-        elif isinstance(numerical_input, np.ndarray):
-            values = numerical_input.flatten().tolist()
+        # Initialize text processor for text-like encoding
+        if tokenizer is None:
+            self.text_processor = TextProcessor(target_shape, device)
         else:
-            values = [float(x) for x in numerical_input]
-        
-        target_height, target_width, target_channels = self.target_shape
-        
-        # Create tensor representation
-        if len(values) <= target_height * target_width:
-            # Pad with zeros
-            padded_values = values + [0.0] * (target_height * target_width - len(values))
-        else:
-            # Truncate or sample
-            step = len(values) / (target_height * target_width)
-            padded_values = [values[int(i * step)] for i in range(target_height * target_width)]
-        
-        # Convert to tensor
-        tensor = torch.tensor(padded_values, dtype=torch.float32, device=self.device)
-        tensor = tensor.view(target_height, target_width)
-        
-        # Normalize to [0, 1] range
-        if tensor.max() != tensor.min():
-            tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
-        
-        # Expand to 3 channels
-        tensor = tensor.unsqueeze(-1).expand(-1, -1, target_channels)
-        
-        # Add one-hot encoded data type column
-        tensor = self._add_data_type_column(tensor, 'numerical')
-        
-        # Add sequence dimension
-        return tensor.unsqueeze(0)
+            self.text_processor = TextProcessor(target_shape, device, tokenizer)
     
-    def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
-        """Add one-hot encoded data type column to the left of the tensor."""
-        one_hot = torch.tensor(DATA_TYPES[data_type], dtype=torch.float32, device=self.device)
-        one_hot = one_hot.unsqueeze(0).expand(12, -1)
-        one_hot = one_hot.unsqueeze(1)
-        result = torch.cat([one_hot, tensor], dim=1)
-        return result
+    def process(self, numerical_input: Union[np.ndarray, List[float], torch.Tensor]) -> torch.Tensor:
+        """
+        Process numerical input to target tensor shape.
+        
+        Args:
+            numerical_input: Numerical data as array, list, or tensor
+            
+        Returns:
+            Tensor of shape (target_height, target_width+1, target_channels)
+        """
+        # Convert to text representation
+        text_representation = self._numerical_to_text(numerical_input)
+        
+        # Process using text processor
+        tensor = self.text_processor.process(text_representation)
+        
+        return tensor
+    
+    def _numerical_to_text(self, numerical_input: Union[np.ndarray, List[float], torch.Tensor]) -> str:
+        """Convert numerical data to text representation."""
+        if isinstance(numerical_input, torch.Tensor):
+            numerical_input = numerical_input.cpu().numpy()
+        elif isinstance(numerical_input, list):
+            numerical_input = np.array(numerical_input)
+        
+        # Flatten and convert to text
+        flat_data = numerical_input.flatten()
+        text_lines = []
+        
+        # Add summary statistics
+        if len(flat_data) > 0:
+            text_lines.append(f"mean {np.mean(flat_data):.6f}")
+            text_lines.append(f"std {np.std(flat_data):.6f}")
+            text_lines.append(f"min {np.min(flat_data):.6f}")
+            text_lines.append(f"max {np.max(flat_data):.6f}")
+        
+        # Add individual values
+        for val in flat_data[:100]:  # Limit to first 100 values
+            text_lines.append(f"{val:.6f}")
+        
+        return '\n'.join(text_lines)
 
 
 class AudioProcessor:
@@ -573,63 +756,351 @@ class VideoProcessor:
             return placeholder
 
 
-class GraphProcessor:
-    """Processor for graph inputs."""
+class TabularProcessor:
+    """
+    Processes tabular data with text-like encoding and peripheral view summarization.
+    Left peripheral view contains row summaries, right peripheral view contains column summaries.
+    """
     
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device):
-        self.target_shape = target_shape
+    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
+        """
+        Initialize tabular processor.
+        
+        Args:
+            target_shape: Target tensor shape (height, width, channels)
+            device: PyTorch device
+            tokenizer: Optional binary tokenizer for text processing
+        """
+        self.target_height, self.target_width, self.target_channels = target_shape
         self.device = device
         
-    def process(self, graph_input: Dict[str, Any]) -> torch.Tensor:
-        """Process graph input into tensor sequence."""
-        target_height, target_width, target_channels = self.target_shape
-        
-        # Extract graph components
-        nodes = graph_input.get('nodes', [])
-        edges = graph_input.get('edges', [])
-        
-        # Create adjacency matrix representation
-        if isinstance(nodes, list) and len(nodes) > 0:
-            n_nodes = len(nodes)
-            adj_matrix = np.zeros((n_nodes, n_nodes))
-            
-            # Fill adjacency matrix
-            for edge in edges:
-                if len(edge) >= 2:
-                    i, j = edge[0], edge[1]
-                    if 0 <= i < n_nodes and 0 <= j < n_nodes:
-                        adj_matrix[i, j] = 1
-                        adj_matrix[j, i] = 1  # Undirected graph
-            
-            # Resize to target dimensions
-            resized_matrix = cv2.resize(adj_matrix, (target_width, target_height))
+        # Initialize text processor for text-like encoding
+        if tokenizer is None:
+            self.text_processor = TextProcessor(target_shape, device)
         else:
-            # Create empty graph representation
-            resized_matrix = np.zeros((target_height, target_width))
-        
-        # Convert to tensor
-        tensor = torch.from_numpy(resized_matrix).float().to(self.device)
-        
-        # Normalize to [0, 1]
-        if tensor.max() != tensor.min():
-            tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min())
-        
-        # Expand to 3 channels
-        tensor = tensor.unsqueeze(-1).expand(-1, -1, target_channels)
-        
-        # Add one-hot encoded data type column
-        tensor = self._add_data_type_column(tensor, 'graph')
-        
-        # Add sequence dimension
-        return tensor.unsqueeze(0)
+            self.text_processor = TextProcessor(target_shape, device, tokenizer)
     
-    def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
-        """Add one-hot encoded data type column to the left of the tensor."""
-        one_hot = torch.tensor(DATA_TYPES[data_type], dtype=torch.float32, device=self.device)
-        one_hot = one_hot.unsqueeze(0).expand(12, -1)
-        one_hot = one_hot.unsqueeze(1)
-        result = torch.cat([one_hot, tensor], dim=1)
+    def process(self, tabular_input: Union[pd.DataFrame, np.ndarray, List[List]]) -> torch.Tensor:
+        """
+        Process tabular input to target tensor shape.
+        
+        Args:
+            tabular_input: Tabular data as DataFrame, numpy array, or list of lists
+            
+        Returns:
+            Tensor of shape (target_height, target_width+1, target_channels)
+        """
+        # Convert to DataFrame if needed
+        if isinstance(tabular_input, np.ndarray):
+            df = pd.DataFrame(tabular_input)
+        elif isinstance(tabular_input, list):
+            df = pd.DataFrame(tabular_input)
+        else:
+            df = tabular_input
+        
+        # Process as text-like data
+        text_representation = self._tabular_to_text(df)
+        tensor = self.text_processor.process(text_representation)
+        
+        # Add peripheral view summarization
+        tensor = self._add_peripheral_summaries(tensor, df)
+        
+        return tensor
+    
+    def _tabular_to_text(self, df: pd.DataFrame) -> str:
+        """Convert tabular data to text representation."""
+        # Convert DataFrame to text format
+        text_lines = []
+        
+        # Add column headers
+        text_lines.append(' '.join(str(col) for col in df.columns))
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            text_lines.append(' '.join(str(val) for val in row))
+        
+        return '\n'.join(text_lines)
+    
+    def _add_peripheral_summaries(self, tensor: torch.Tensor, df: pd.DataFrame) -> torch.Tensor:
+        """Add peripheral view summarization to tensor."""
+        # Extract the main tensor (without data type column)
+        main_tensor = tensor[:, 1:, :]
+        
+        # Calculate row and column summaries
+        row_summaries = self._calculate_row_summaries(df)
+        col_summaries = self._calculate_column_summaries(df)
+        
+        # Reshape summaries to fit peripheral views
+        row_summary_tensor = self._reshape_summaries_to_peripheral(row_summaries, 'row')
+        col_summary_tensor = self._reshape_summaries_to_peripheral(col_summaries, 'column')
+        
+        # Combine main tensor with peripheral views
+        result = torch.cat([row_summary_tensor, main_tensor, col_summary_tensor], dim=1)
+        
+        # Add data type column back
+        data_type_col = tensor[:, 0:1, :]
+        result = torch.cat([data_type_col, result], dim=1)
+        
         return result
+    
+    def _calculate_row_summaries(self, df: pd.DataFrame) -> np.ndarray:
+        """Calculate summary statistics for each row."""
+        summaries = []
+        for _, row in df.iterrows():
+            # Calculate basic statistics for the row
+            numeric_vals = pd.to_numeric(row, errors='coerce').dropna()
+            if len(numeric_vals) > 0:
+                summary = [
+                    numeric_vals.mean(),
+                    numeric_vals.std(),
+                    numeric_vals.min(),
+                    numeric_vals.max()
+                ]
+            else:
+                summary = [0.0, 0.0, 0.0, 0.0]
+            summaries.append(summary)
+        
+        return np.array(summaries)
+    
+    def _calculate_column_summaries(self, df: pd.DataFrame) -> np.ndarray:
+        """Calculate summary statistics for each column."""
+        summaries = []
+        for col in df.columns:
+            numeric_vals = pd.to_numeric(df[col], errors='coerce').dropna()
+            if len(numeric_vals) > 0:
+                summary = [
+                    numeric_vals.mean(),
+                    numeric_vals.std(),
+                    numeric_vals.min(),
+                    numeric_vals.max()
+                ]
+            else:
+                summary = [0.0, 0.0, 0.0, 0.0]
+            summaries.append(summary)
+        
+        return np.array(summaries)
+    
+    def _reshape_summaries_to_peripheral(self, summaries: np.ndarray, summary_type: str) -> torch.Tensor:
+        """Reshape summaries to fit peripheral view dimensions."""
+        if summary_type == 'row':
+            # Left peripheral view: (12, 1, 3)
+            peripheral_width = 1
+        else:
+            # Right peripheral view: (12, 1, 3)
+            peripheral_width = 1
+        
+        # Pad or truncate summaries to fit peripheral dimensions
+        target_size = self.target_height * peripheral_width * self.target_channels
+        
+        flat_summaries = summaries.flatten()
+        if len(flat_summaries) < target_size:
+            # Pad with zeros
+            padding = np.zeros(target_size - len(flat_summaries))
+            flat_summaries = np.concatenate([flat_summaries, padding])
+        else:
+            # Truncate
+            flat_summaries = flat_summaries[:target_size]
+        
+        # Reshape to peripheral dimensions
+        peripheral_tensor = torch.tensor(flat_summaries, dtype=torch.float32).reshape(
+            self.target_height, peripheral_width, self.target_channels
+        )
+        
+        return peripheral_tensor
+
+class GraphProcessor:
+    """
+    Processes graph data as tabular data with neighbor and node attribute summarization.
+    Left peripheral view contains neighbor summaries, right peripheral view contains node attribute summaries.
+    """
+    
+    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
+        """
+        Initialize graph processor.
+        
+        Args:
+            target_shape: Target tensor shape (height, width, channels)
+            device: PyTorch device
+            tokenizer: Optional binary tokenizer for text processing
+        """
+        self.target_height, self.target_width, self.target_channels = target_shape
+        self.device = device
+        
+        # Initialize tabular processor for base processing
+        if tokenizer is None:
+            self.tabular_processor = TabularProcessor(target_shape, device)
+        else:
+            self.tabular_processor = TabularProcessor(target_shape, device, tokenizer)
+    
+    def process(self, graph_input: Union[nx.Graph, np.ndarray, List[List]]) -> torch.Tensor:
+        """
+        Process graph input to target tensor shape.
+        
+        Args:
+            graph_input: Graph as NetworkX object, adjacency matrix, or edge list
+            
+        Returns:
+            Tensor of shape (target_height, target_width+1, target_channels)
+        """
+        # Convert to NetworkX graph if needed
+        if isinstance(graph_input, np.ndarray):
+            # Assume it's an adjacency matrix
+            graph = nx.from_numpy_array(graph_input)
+        elif isinstance(graph_input, list):
+            # Assume it's an edge list
+            graph = nx.from_edgelist(graph_input)
+        else:
+            graph = graph_input
+        
+        # Convert graph to tabular representation
+        tabular_data = self._graph_to_tabular(graph)
+        
+        # Process using tabular processor
+        tensor = self.tabular_processor.process(tabular_data)
+        
+        # Add graph-specific peripheral summarization
+        tensor = self._add_graph_peripheral_summaries(tensor, graph)
+        
+        return tensor
+    
+    def _graph_to_tabular(self, graph: nx.Graph) -> pd.DataFrame:
+        """Convert graph to tabular representation."""
+        # Extract node attributes
+        node_attrs = {}
+        for node in graph.nodes():
+            attrs = graph.nodes[node]
+            node_attrs[node] = attrs
+        
+        # Extract edge attributes
+        edge_attrs = {}
+        for edge in graph.edges():
+            attrs = graph.edges[edge]
+            edge_attrs[edge] = attrs
+        
+        # Create tabular representation
+        # This is a simplified approach - in practice you'd want more sophisticated conversion
+        data = []
+        
+        # Add node information
+        for node, attrs in node_attrs.items():
+            row = [f"node_{node}"]
+            for key, value in attrs.items():
+                row.append(f"{key}_{value}")
+            data.append(row)
+        
+        # Add edge information
+        for edge, attrs in edge_attrs.items():
+            row = [f"edge_{edge[0]}_{edge[1]}"]
+            for key, value in attrs.items():
+                row.append(f"{key}_{value}")
+            data.append(row)
+        
+        # Pad rows to consistent length
+        max_len = max(len(row) for row in data)
+        for row in data:
+            while len(row) < max_len:
+                row.append("")
+        
+        return pd.DataFrame(data)
+    
+    def _add_graph_peripheral_summaries(self, tensor: torch.Tensor, graph: nx.Graph) -> torch.Tensor:
+        """Add graph-specific peripheral summarization."""
+        # Extract the main tensor (without data type column)
+        main_tensor = tensor[:, 1:, :]
+        
+        # Calculate neighbor and node attribute summaries
+        neighbor_summaries = self._calculate_neighbor_summaries(graph)
+        node_attr_summaries = self._calculate_node_attribute_summaries(graph)
+        
+        # Reshape summaries to fit peripheral views
+        neighbor_summary_tensor = self._reshape_summaries_to_peripheral(neighbor_summaries, 'neighbor')
+        node_attr_summary_tensor = self._reshape_summaries_to_peripheral(node_attr_summaries, 'node_attr')
+        
+        # Combine main tensor with peripheral views
+        result = torch.cat([neighbor_summary_tensor, main_tensor, node_attr_summary_tensor], dim=1)
+        
+        # Add data type column back
+        data_type_col = tensor[:, 0:1, :]
+        result = torch.cat([data_type_col, result], dim=1)
+        
+        return result
+    
+    def _calculate_neighbor_summaries(self, graph: nx.Graph) -> np.ndarray:
+        """Calculate neighbor-related summaries for each node."""
+        summaries = []
+        for node in graph.nodes():
+            neighbors = list(graph.neighbors(node))
+            if neighbors:
+                # Calculate neighbor statistics
+                neighbor_degrees = [graph.degree(n) for n in neighbors]
+                summary = [
+                    len(neighbors),  # Number of neighbors
+                    np.mean(neighbor_degrees) if neighbor_degrees else 0,  # Average neighbor degree
+                    np.std(neighbor_degrees) if neighbor_degrees else 0,   # Std of neighbor degrees
+                    max(neighbor_degrees) if neighbor_degrees else 0       # Max neighbor degree
+                ]
+            else:
+                summary = [0.0, 0.0, 0.0, 0.0]
+            summaries.append(summary)
+        
+        return np.array(summaries)
+    
+    def _calculate_node_attribute_summaries(self, graph: nx.Graph) -> np.ndarray:
+        """Calculate node attribute summaries."""
+        summaries = []
+        for node in graph.nodes():
+            attrs = graph.nodes[node]
+            if attrs:
+                # Extract numeric attributes
+                numeric_attrs = []
+                for value in attrs.values():
+                    try:
+                        numeric_attrs.append(float(value))
+                    except (ValueError, TypeError):
+                        continue
+                
+                if numeric_attrs:
+                    summary = [
+                        np.mean(numeric_attrs),
+                        np.std(numeric_attrs),
+                        np.min(numeric_attrs),
+                        np.max(numeric_attrs)
+                    ]
+                else:
+                    summary = [0.0, 0.0, 0.0, 0.0]
+            else:
+                summary = [0.0, 0.0, 0.0, 0.0]
+            summaries.append(summary)
+        
+        return np.array(summaries)
+    
+    def _reshape_summaries_to_peripheral(self, summaries: np.ndarray, summary_type: str) -> torch.Tensor:
+        """Reshape summaries to fit peripheral view dimensions."""
+        if summary_type == 'neighbor':
+            # Left peripheral view: (12, 1, 3)
+            peripheral_width = 1
+        else:
+            # Right peripheral view: (12, 1, 3)
+            peripheral_width = 1
+        
+        # Pad or truncate summaries to fit peripheral dimensions
+        target_size = self.target_height * peripheral_width * self.target_channels
+        
+        flat_summaries = summaries.flatten()
+        if len(flat_summaries) < target_size:
+            # Pad with zeros
+            padding = np.zeros(target_size - len(flat_summaries))
+            flat_summaries = np.concatenate([flat_summaries, padding])
+        else:
+            # Truncate
+            flat_summaries = flat_summaries[:target_size]
+        
+        # Reshape to peripheral dimensions
+        peripheral_tensor = torch.tensor(flat_summaries, dtype=torch.float32).reshape(
+            self.target_height, peripheral_width, self.target_channels
+        )
+        
+        return peripheral_tensor
 
 
 class BatchProcessor:
@@ -680,40 +1151,174 @@ class BatchProcessor:
 
 
 class InputValidator:
-    """Validator for input data."""
+    """Validates input tensors and data types."""
     
     @staticmethod
-    def validate_tensor_shape(tensor: torch.Tensor, expected_shape: Tuple[int, int, int]) -> bool:
-        """Validate that tensor has the expected shape with data type column."""
-        if len(tensor.shape) != 4:  # (sequence, height, width+1, channels)
+    def validate_tensor_shape(tensor: torch.Tensor, expected_height: int = 12, expected_channels: int = 3) -> bool:
+        """
+        Validate tensor shape including data type column and peripheral views.
+        
+        Args:
+            tensor: Tensor to validate
+            expected_height: Expected height dimension
+            expected_channels: Expected number of channels
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if tensor.dim() != 4:
+            print(f"Expected 4D tensor, got {tensor.dim()}D")
             return False
         
-        _, height, width, channels = tensor.shape
-        # Width should be original width + 1 (for data type column)
-        expected_width = expected_shape[1] + 1
-        return (height, width, channels) == (expected_shape[0], expected_width, expected_shape[2])
-    
-    @staticmethod
-    def validate_sequence_length(tensor: torch.Tensor, max_length: Optional[int]) -> bool:
-        """Validate sequence length."""
-        if max_length is None:
-            return True
-        return tensor.shape[0] <= max_length
-    
-    @staticmethod
-    def validate_input_range(tensor: torch.Tensor, min_val: float = 0.0, max_val: float = 1.0) -> bool:
-        """Validate that tensor values are in the expected range."""
-        return torch.all((tensor >= min_val) & (tensor <= max_val))
+        sequence_length, height, width, channels = tensor.shape
+        
+        if height != expected_height:
+            print(f"Expected height {expected_height}, got {height}")
+            return False
+        
+        if channels != expected_channels:
+            print(f"Expected channels {expected_channels}, got {channels}")
+            return False
+        
+        # Width should be at least 13 (1 data type + 12 main content)
+        # For data with peripheral views, width will be larger
+        if width < 13:
+            print(f"Expected width >= 13, got {width}")
+            return False
+        
+        return True
     
     @staticmethod
     def validate_data_type_column(tensor: torch.Tensor) -> bool:
-        """Validate that the first column contains valid one-hot encoded data types."""
-        if tensor.shape[3] != 3:  # Should have 3 channels
+        """
+        Validate the data type column in the tensor.
+        
+        Args:
+            tensor: Tensor to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if tensor.dim() != 4:
             return False
         
-        # Check first column (data type column)
-        first_col = tensor[:, :, 0, :]  # Shape: (sequence, height, 3)
+        # Extract data type column (first column)
+        data_type_col = tensor[:, :, 0, :]
         
-        # Each row should sum to 1 (one-hot encoding)
-        row_sums = torch.sum(first_col, dim=-1)
-        return torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-6)
+        # Check that each row has exactly one data type indicator
+        # Data type should be one-hot encoded across the 3 channels
+        for seq_idx in range(data_type_col.shape[0]):
+            for row_idx in range(data_type_col.shape[1]):
+                row_data = data_type_col[seq_idx, row_idx, :]
+                
+                # Check if it's a valid one-hot encoding
+                if not torch.allclose(row_data.sum(), torch.tensor(1.0), atol=1e-6):
+                    return False
+                
+                # Check if values are binary (0 or 1)
+                if not torch.all((row_data == 0) | (row_data == 1)):
+                    return False
+        
+        return True
+    
+    @staticmethod
+    def validate_peripheral_views(tensor: torch.Tensor) -> bool:
+        """
+        Validate peripheral view structure in the tensor.
+        
+        Args:
+            tensor: Tensor to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if tensor.dim() != 4:
+            return False
+        
+        sequence_length, height, width, channels = tensor.shape
+        
+        # If width > 13, we have peripheral views
+        if width > 13:
+            # Check that peripheral views have reasonable dimensions
+            # Left peripheral: width 1
+            # Main content: width 12
+            # Right peripheral: width 1
+            # Total: 1 + 12 + 1 = 14
+            
+            if width == 14:
+                # Standard peripheral view structure
+                return True
+            elif width > 14:
+                # Extended peripheral view structure
+                return True
+            else:
+                print(f"Invalid peripheral view structure: width {width}")
+                return False
+        
+        return True
+    
+    @staticmethod
+    def validate_tensor_content(tensor: torch.Tensor) -> bool:
+        """
+        Validate the content of the tensor.
+        
+        Args:
+            tensor: Tensor to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if tensor.dim() != 4:
+            return False
+        
+        # Check for NaN or infinite values
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            print("Tensor contains NaN or infinite values")
+            return False
+        
+        # Check value ranges (should be reasonable for normalized data)
+        tensor_min = tensor.min().item()
+        tensor_max = tensor.max().item()
+        
+        # Allow for some flexibility in value ranges
+        if tensor_min < -10 or tensor_max > 10:
+            print(f"Tensor values out of expected range: [{tensor_min}, {tensor_max}]")
+            return False
+        
+        return True
+    
+    @staticmethod
+    def validate_complete_tensor(tensor: torch.Tensor) -> bool:
+        """
+        Perform complete validation of a tensor.
+        
+        Args:
+            tensor: Tensor to validate
+            
+        Returns:
+            True if all validations pass, False otherwise
+        """
+        print(f"Validating tensor with shape: {tensor.shape}")
+        
+        # Basic shape validation
+        if not InputValidator.validate_tensor_shape(tensor):
+            print("❌ Shape validation failed")
+            return False
+        
+        # Data type column validation
+        if not InputValidator.validate_data_type_column(tensor):
+            print("❌ Data type column validation failed")
+            return False
+        
+        # Peripheral view validation
+        if not InputValidator.validate_peripheral_views(tensor):
+            print("❌ Peripheral view validation failed")
+            return False
+        
+        # Content validation
+        if not InputValidator.validate_tensor_content(tensor):
+            print("❌ Content validation failed")
+            return False
+        
+        print("✅ All validations passed")
+        return True

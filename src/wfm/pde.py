@@ -15,7 +15,7 @@ from .spherical_mesh import SphericalMesh
 from .functional import FitzhughNagumo
 
 REACTION_FUNCTIONS = {
-    "fitzhugh-nagumo": FitzhughNagumo, 
+    "fitzhugh-nagumo": FitzhughNagumo,
 }
 
 

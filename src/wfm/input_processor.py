@@ -6,34 +6,30 @@ into sequences of 12x12x3 dimensional tensors for the foundation model.
 """
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
 from typing import Union, List, Tuple, Optional, Dict, Any, Sequence
 import numpy as np
 from PIL import Image
 import cv2
-import json
-import re
-from pathlib import Path
 import librosa
 import warnings
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_similarity
-import pandas as pd
-import networkx as nx
+import polars as pl
+import os
 
 # Suppress librosa warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='librosa')
 
 # Data type constants for one-hot encoding
-DATA_TYPES = {
-    'image': [1, 0, 0],
-    'audio': [0, 1, 0], 
-    'video': [0, 0, 1],
-    'text': [1, 0, 0],      # Map text to image type for now
-    'numerical': [1, 0, 0],  # Map numerical to image type for now
-    'graph': [1, 0, 0]       # Map graph to image type for now
-}
+DATA_TYPES = [
+    "text",
+    "image",
+    "audio",
+    "video",
+    "num",
+    "table",
+    "code"
+]
 
 
 class InputProcessor:
@@ -48,7 +44,7 @@ class InputProcessor:
     - Right peripheral view: node attributes/column summaries
     """
     
-    def __init__(self, target_shape: Tuple[int, int, int] = (12, 12, 3), device: Optional[torch.device] = None):
+    def __init__(self, target_shape: Tuple[int, int, int] = (4, 4, 3), base_model: str = "utter-project/EuroLLM-1.7B-Instruct", code_model: str = "google/codegemma-2b", device: Optional[torch.device | str] = None):
         """
         Initialize the input processor.
         
@@ -58,174 +54,105 @@ class InputProcessor:
         """
         self.target_shape = target_shape
         self.device = device or torch.device('cpu')
+
+        # Initialize text-based processors with shared tokenizer
+        self.text_binary_tokenizer = BinaryTokenizer(
+            base_tokenizer=base_model, 
+            base_embedder=base_model, 
+            binary_dim=16  # 4**2 for focus patch size
+        )
+        self.text_processor = TextProcessor(target_shape, self.device, self.text_binary_tokenizer)
         
         # Initialize specialized processors
         self.image_processor = ImageProcessor(target_shape, self.device)
         self.audio_processor = AudioProcessor(target_shape, self.device)
         self.video_processor = VideoProcessor(target_shape, self.device)
         
-        # Initialize text-based processors with shared tokenizer
-        self.binary_tokenizer = BinaryTokenizer(
-            base_tokenizer=None,  # Will create mock tokenizer
-            vocab_size=4096,
-            binary_dim=144  # 12² for focus patch size
+        self.numerical_processor = NumericalProcessor(target_shape, self.device, self.text_binary_tokenizer)
+        self.tabular_processor = TabularProcessor(target_shape, self.device, self.text_binary_tokenizer)
+
+        self.code_binary_tokenizer = BinaryTokenizer(
+            base_tokenizer=code_model, 
+            base_embedder=code_model, 
+            binary_dim=16  # 4**2 for focus patch size
         )
-        self.text_processor = TextProcessor(target_shape, self.device, self.binary_tokenizer)
-        self.numerical_processor = NumericalProcessor(target_shape, self.device, self.binary_tokenizer)
-        self.tabular_processor = TabularProcessor(target_shape, self.device, self.binary_tokenizer)
-        self.graph_processor = GraphProcessor(target_shape, self.device, self.binary_tokenizer)
+        self.code_processor = TextProcessor(target_shape, self.device, self.code_binary_tokenizer)
     
-    def process_input(self, input_data: Any) -> torch.Tensor:
+    def process_input(self, input_data: Any, is_ordered: bool = True) -> torch.Tensor:
         """
         Process input data to tensor sequence.
         
         Args:
             input_data: Input data of various types
+            is_ordered: Whether the input data is ordered
             
         Returns:
             Tensor of shape (sequence_length, height, width+1, channels)
         """
-        # Determine input type and process accordingly
-        if self._is_image(input_data):
-            return self.image_processor.process(input_data).unsqueeze(0)
-        elif self._is_audio(input_data):
-            return self.audio_processor.process(input_data).unsqueeze(0)
-        elif self._is_video(input_data):
-            return self.video_processor.process(input_data)
-        elif self._is_text(input_data):
-            return self.text_processor.process(input_data).unsqueeze(0)
-        elif self._is_numerical(input_data):
-            return self.numerical_processor.process(input_data).unsqueeze(0)
-        elif self._is_tabular(input_data):
-            return self.tabular_processor.process(input_data).unsqueeze(0)
-        elif self._is_graph(input_data):
-            return self.graph_processor.process(input_data).unsqueeze(0)
+
+        if is_ordered:
+            # Determine input type and process accordingly
+            if self._is_text(input_data):
+                return self.text_processor.process(input_data)
+            elif self._is_audio(input_data):
+                return self.audio_processor.process(input_data)
+            elif self._is_video(input_data):
+                return self.video_processor.process(input_data)
+            elif self._is_code(input_data):
+                return self.code_processor.process(input_data)
+            else:
+                raise ValueError(f"Unsupported input type: {type(input_data)}")
         else:
-            raise ValueError(f"Unsupported input type: {type(input_data)}")
+            if self._is_image(input_data):
+                return self.image_processor.process(input_data)
+            elif self._is_numerical(input_data):
+                return self.numerical_processor.process(input_data)
+            elif self._is_tabular(input_data):
+                return self.tabular_processor.process(input_data)
+            else:
+                raise ValueError(f"Unsupported input type: {type(input_data)}")
     
     def _is_image(self, data: Any) -> bool:
         """Check if data is image-like."""
-        return (isinstance(data, (str, np.ndarray, torch.Tensor)) and 
-                (isinstance(data, str) and data.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')) or
-                 isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) >= 2))
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))
+        data_case = isinstance(data, (np.ndarray, torch.Tensor)) and 3 <= len(data.shape) <= 4
+        return file_case or data_case
     
     def _is_audio(self, data: Any) -> bool:
         """Check if data is audio-like."""
-        return (isinstance(data, str) and data.lower().endswith(('.wav', '.mp3', '.flac', '.ogg')) or
-                isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) == 1)
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith(('.wav', '.mp3', '.flac', '.ogg'))
+        data_case = isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) <= 2
+        return file_case or data_case
     
     def _is_video(self, data: Any) -> bool:
         """Check if data is video-like."""
-        return isinstance(data, str) and data.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+        data_case = isinstance(data, (np.ndarray, torch.Tensor)) and 4 <= len(data.shape) <=5
+        return file_case or data_case
     
     def _is_text(self, data: Any) -> bool:
         """Check if data is text-like."""
-        return isinstance(data, str) and not any(data.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.wav', '.mp3', '.flac', '.ogg', '.mp4', '.avi', '.mov', '.mkv'])
-    
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith(('.txt', '.doc', '.docx', '.pdf'))
+        data_case = isinstance(data, str) and not any([self._is_audio(data), self._is_video(data), self._is_code(data)])
+        return file_case or data_case
+
     def _is_numerical(self, data: Any) -> bool:
         """Check if data is numerical-like."""
-        return isinstance(data, (int, float, np.number, np.ndarray, torch.Tensor, list)) and not self._is_image(data)
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith((".dat"))
+        data_case = isinstance(data, (float, int, np.number)) or (isinstance(data, (np.ndarray, torch.Tensor)) and len(data.shape) <= 1)
+        return file_case or data_case
     
     def _is_tabular(self, data: Any) -> bool:
         """Check if data is tabular-like."""
-        return isinstance(data, pd.DataFrame) or (isinstance(data, np.ndarray) and len(data.shape) == 2)
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith((".csv", ".tsv", ".xlsx", ".xls", ".parquet", ".json"))
+        data_case = isinstance(data, (pl.DataFrame, np.ndarray)) and len(data.shape) == 2
+        return file_case or data_case
     
-    def _is_graph(self, data: Any) -> bool:
-        """Check if data is graph-like."""
-        return isinstance(data, nx.Graph) or (isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)))
-
-
-class ImageProcessor:
-    """Processor for image inputs with focal vs peripheral area distinction."""
-    
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device):
-        self.target_shape = target_shape
-        self.device = device
-        
-    def process(self, image_input: Union[str, np.ndarray, torch.Tensor, Image.Image]) -> torch.Tensor:
-        """Process image input into tensor sequence with focal/peripheral distinction."""
-        # Convert to tensor if needed
-        if isinstance(image_input, str):
-            # Load image from file path
-            image = self._load_image(image_input)
-        elif isinstance(image_input, Image.Image):
-            image = np.array(image_input)
-        elif isinstance(image_input, np.ndarray):
-            image = image_input
-        elif isinstance(image_input, torch.Tensor):
-            image = image_input.cpu().numpy()
-        else:
-            raise ValueError(f"Unsupported image input type: {type(image_input)}")
-        
-        # Process image with focal vs peripheral areas
-        processed_image = self._process_focal_peripheral(image)
-        
-        # Add one-hot encoded data type column
-        tensor = self._add_data_type_column(processed_image, 'image')
-        
-        # Add sequence dimension
-        return tensor.unsqueeze(0)
-    
-    def _load_image(self, image_path: str) -> np.ndarray:
-        """Load image from file path."""
-        try:
-            # Try PIL first
-            image = Image.open(image_path)
-            return np.array(image)
-        except:
-            try:
-                # Try OpenCV
-                image = cv2.imread(image_path)
-                if image is not None:
-                    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                else:
-                    raise ValueError(f"Could not load image from: {image_path}")
-            except:
-                raise ValueError(f"Failed to load image from: {image_path}")
-    
-    def _process_focal_peripheral(self, image: np.ndarray) -> torch.Tensor:
-        """Process image distinguishing focal (central 4x4) from peripheral areas."""
-        target_height, target_width, target_channels = self.target_shape
-        
-        if len(image.shape) == 2:
-            # Grayscale image
-            resized = cv2.resize(image, (target_width, target_height))
-            # Convert to 3-channel by repeating
-            resized = np.stack([resized] * 3, axis=-1)
-        else:
-            # Color image
-            resized = cv2.resize(image, (target_width, target_height))
-            
-            # Ensure 3 channels
-            if resized.shape[-1] == 1:
-                resized = np.concatenate([resized] * 3, axis=-1)
-            elif resized.shape[-1] == 4:
-                resized = resized[:, :, :3]  # Remove alpha channel
-        
-        # Convert to tensor
-        tensor = torch.from_numpy(resized).float().to(self.device)
-        tensor = self._normalize_image(tensor)
-        
-        return tensor
-    
-    def _normalize_image(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Normalize image tensor to [0, 1] range."""
-        if tensor.max() > 1.0:
-            tensor = tensor / 255.0
-        return tensor
-    
-    def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
-        """Add one-hot encoded data type column to the left of the tensor."""
-        # Create one-hot encoded column
-        one_hot = torch.tensor(DATA_TYPES[data_type], dtype=torch.float32, device=self.device)
-        one_hot = one_hot.unsqueeze(0).expand(12, -1)  # Shape: (12, 3)
-        
-        # Concatenate along width dimension (dim=1)
-        # Original tensor: (12, 12, 3), one_hot: (12, 1, 3)
-        one_hot = one_hot.unsqueeze(1)  # Shape: (12, 1, 3)
-        result = torch.cat([one_hot, tensor], dim=1)  # Shape: (12, 13, 3)
-        
-        return result
+    def _is_code(self, data: Any) -> bool:
+        """Check if data is code-like."""
+        file_case = isinstance(data, str) and os.path.exists(data) and data.lower().endswith(('.py', '.html', '.css', '.js', '.java', '.c', '.cpp', '.h', '.hpp', '.bat', '.sh', '.ps1', '.sql', '.xml', '.yaml', '.toml'))
+        data_case = isinstance(data, str) and not any([self._is_audio(data), self._is_video(data), self._is_text(data)])
+        return file_case or data_case
 
 
 class BinaryTokenizer:
@@ -234,18 +161,24 @@ class BinaryTokenizer:
     Tokens are encoded as binary vectors stored as base-10 integers.
     """
     
-    def __init__(self, base_tokenizer, vocab_size: int = 4096, binary_dim: int = 144):
+    def __init__(self, base_tokenizer, base_embedder, binary_dim: int = 16):
         """
         Initialize the binary tokenizer.
         
         Args:
             base_tokenizer: A pre-trained multilingual tokenizer (e.g., from transformers)
-            vocab_size: Maximum vocabulary size for the binary tokenizer
+            base_embedder: A pre-trained multilingual embedding layer (e.g., from transformers)
             binary_dim: Dimension of binary vectors (should be L² where L is focus patch size)
         """
-        self.base_tokenizer = base_tokenizer
-        self.vocab_size = vocab_size
+
+        if not np.sqrt(binary_dim).is_integer():
+            raise ValueError("Binary dimension must be a perfect square")
+
+        self.base_tokenizer = AutoTokenizer.from_pretrained(base_tokenizer) if isinstance(base_tokenizer, str) else base_tokenizer
+        self.base_embedder = AutoModel.from_pretrained(base_embedder) if isinstance(base_embedder, str) else base_embedder
+        self.vocab_size = 8**binary_dim
         self.binary_dim = binary_dim
+        self.L = int(np.sqrt(binary_dim))
         self.token_to_binary = {}
         self.binary_to_token = {}
         self.token_embeddings = None
@@ -256,124 +189,91 @@ class BinaryTokenizer:
         """Build binary vocabulary using hierarchical clustering on base tokenizer embeddings."""
         # Get embeddings from base tokenizer
         if hasattr(self.base_tokenizer, 'get_vocab'):
-            vocab = list(self.base_tokenizer.get_vocab().keys())[:self.vocab_size]
+            vocab = list(self.base_tokenizer.get_vocab().keys())
         else:
-            vocab = list(self.base_tokenizer.vocab.keys())[:self.vocab_size]
+            vocab = list(self.base_tokenizer.vocab.keys())
+
+        extended_vocab = vocab + [f"<{category}>" for category in DATA_TYPES] + [f"</{category}>" for category in DATA_TYPES] + list(self.base_tokenizer.special_tokens_dict.keys())
+        self.extended_vocab = extended_vocab[-1:-self.vocab_size-1:-1]
         
-        # Get embeddings (simplified - in practice you'd use the actual embedding matrix)
-        embeddings = self._get_embeddings(vocab)
+        # Get embeddings
+        W = self.base_embedder.weight.data.numpy()
+        if W.shape[0] < W.shape[1]:
+            W = W.T
+        embeddings = W[-1:-len(vocab)-1:-1]
+        embeddings = np.concatenate([
+            np.random.randn(len(self.extended_vocab) - len(vocab), W.shape[1]),
+            embeddings
+        ], axis = 0)
         
         # Perform hierarchical clustering
-        clustering = AgglomerativeClustering(
-            n_clusters=min(self.vocab_size, len(vocab)),
-            linkage='ward'
-        )
+        clustering = AgglomerativeClustering(min(self.vocab_size, len(self.extended_vocab)))
         cluster_labels = clustering.fit_predict(embeddings)
         
         # Assign binary codes based on clustering
-        self._assign_binary_codes(vocab, cluster_labels)
-    
-    def _get_embeddings(self, vocab: List[str]) -> np.ndarray:
-        """Get embeddings for vocabulary tokens."""
-        # Simplified embedding generation - in practice use actual tokenizer embeddings
-        np.random.seed(42)  # For reproducibility
-        embeddings = np.random.randn(len(vocab), 768)  # Standard embedding dimension
-        return embeddings
+        self._assign_binary_codes(self.extended_vocab, cluster_labels)
     
     def _assign_binary_codes(self, vocab: List[str], cluster_labels: np.ndarray):
         """Assign binary codes to tokens based on clustering."""
-        unique_clusters = np.unique(cluster_labels)
         
-        for i, token in enumerate(vocab):
-            cluster_id = cluster_labels[i]
-            
-            # Create binary code based on cluster position and token position
-            binary_code = self._create_binary_code(cluster_id, i, len(unique_clusters))
-            
-            # Convert binary to base-10 integer
-            integer_code = int(''.join(map(str, binary_code)), 2)
-            
-            self.token_to_binary[token] = integer_code
-            self.binary_to_token[integer_code] = token
+        for i, (token, cluster_id) in enumerate(zip(vocab, cluster_labels)):
+            self.token_to_binary[token] = cluster_id
+            self.binary_to_token[cluster_id] = token
     
-    def _create_binary_code(self, cluster_id: int, token_pos: int, num_clusters: int) -> List[int]:
-        """Create binary code for a token."""
-        # Use cluster_id and token_pos to create a unique binary representation
-        # This is a simplified approach - in practice you'd want more sophisticated encoding
-        
-        # Ensure binary_dim is a perfect square for L² representation
-        L = int(np.sqrt(self.binary_dim))
-        if L * L != self.binary_dim:
-            L = int(np.sqrt(self.binary_dim))
-            self.binary_dim = L * L
-        
-        # Create binary code
-        binary = [0] * self.binary_dim
-        
-        # Use cluster_id and token_pos to set bits
-        cluster_bits = min(8, L)  # Use first L bits for cluster
-        token_bits = min(8, L)    # Use next L bits for token position
-        
-        # Set cluster bits
-        for i in range(cluster_bits):
-            if cluster_id & (1 << i):
-                binary[i] = 1
-        
-        # Set token position bits
-        for i in range(token_bits):
-            if token_pos & (1 << i):
-                binary[L + i] = 1
-        
-        return binary
-    
-    def encode(self, text: str) -> List[int]:
+    def encode(self, texts: str | List[str]) -> List[int]:
         """Encode text to list of binary integer codes."""
+
+        if isinstance(texts, str):
+            texts = [texts]
+
         # Tokenize with base tokenizer
         if hasattr(self.base_tokenizer, 'encode'):
-            tokens = self.base_tokenizer.encode(text)
+            tokenized_texts = self.base_tokenizer.encode(texts)
         else:
-            tokens = self.base_tokenizer.tokenize(text)
+            tokenized_texts = self.base_tokenizer.tokenize(texts)
+
+        max_seq_length = max(len(encoding) for encoding in tokenized_texts)
         
         # Convert to binary codes
         binary_codes = []
-        for token in tokens:
-            if token in self.token_to_binary:
-                binary_codes.append(self.token_to_binary[token])
-            else:
-                # Handle unknown tokens with a default code
-                binary_codes.append(0)
+        for encoding in tokenized_texts:
+            binary_codes.append([])
+            for token in encoding:
+                if token not in self.token_to_binary:
+                    self.token_to_binary[token] = max(self.token_to_binary.values()) + 1
+                    self.binary_to_token[max(self.token_to_binary.values()) + 1] = token
+
+                binary_codes[-1].append(
+                    np.fromstring(np.binary_repr(self.token_to_binary[token], self.binary_dim*3, signed = False), dtype = "S1").astype(np.int8)
+                )
+            binary_codes[-1] = np.pad(binary_codes[-1], (0, max_seq_length - len(encoding)), mode = 'constant')
+
+        binary_codes = np.array(binary_codes, dtype = np.int8).reshape(-1, max_seq_length, self.L, self.L, 3)
+        # shape: (batch_size, sequence_length, L, L, 3)
         
         return binary_codes
     
-    def decode(self, binary_codes: List[int]) -> str:
+    def decode(self, binary_codes: List[List[int | np.ndarray]]) -> str:
         """Decode binary integer codes back to text."""
-        tokens = []
-        for code in binary_codes:
-            if code in self.binary_to_token:
-                tokens.append(self.binary_to_token[code])
-            else:
-                tokens.append('<UNK>')
+        decoded_texts = []
+        for encoding in binary_codes:
+            text = ""
+            for code in encoding:
+                if isinstance(code, int):
+                    token_id = code
+                else:
+                    token_id = code.reshape(-1).dot(2**np.arange(self.binary_dim*3))
+
+                new_token = self.binary_to_token.get(token_id, '<???>')
+                if new_token.startswith("Ġ") or new_token.startswith("#"):
+                    text += new_token[1:]
+                else:
+                    text += " " + new_token
+
+            decoded_texts.append(text.strip())
         
-        # Join tokens back to text
-        if hasattr(self.base_tokenizer, 'decode'):
-            return self.base_tokenizer.decode(tokens)
-        else:
-            return ' '.join(tokens)
+        return decoded_texts
     
-    def get_binary_matrix(self, text: str) -> torch.Tensor:
-        """Get binary matrix representation of text."""
-        binary_codes = self.encode(text)
-        
-        # Convert to binary matrix
-        matrix = torch.zeros(len(binary_codes), self.binary_dim, dtype=torch.float32)
-        
-        for i, code in enumerate(binary_codes):
-            # Convert integer back to binary
-            binary_str = format(code, f'0{self.binary_dim}b')
-            for j, bit in enumerate(binary_str):
-                matrix[i, j] = float(bit)
-        
-        return matrix
 
 class TextProcessor:
     """
@@ -466,6 +366,99 @@ class TextProcessor:
         
         # Concatenate with original tensor
         result = torch.cat([data_type_col, tensor], dim=1)
+        
+        return result
+
+
+class ImageProcessor:
+    """Processor for image inputs with focal vs peripheral area distinction."""
+    
+    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device):
+        self.target_shape = target_shape
+        self.device = device
+        
+    def process(self, image_input: Union[str, np.ndarray, torch.Tensor, Image.Image]) -> torch.Tensor:
+        """Process image input into tensor sequence with focal/peripheral distinction."""
+        # Convert to tensor if needed
+        if isinstance(image_input, str):
+            # Load image from file path
+            image = self._load_image(image_input)
+        elif isinstance(image_input, Image.Image):
+            image = np.array(image_input)
+        elif isinstance(image_input, np.ndarray):
+            image = image_input
+        elif isinstance(image_input, torch.Tensor):
+            image = image_input.cpu().numpy()
+        else:
+            raise ValueError(f"Unsupported image input type: {type(image_input)}")
+        
+        # Process image with focal vs peripheral areas
+        processed_image = self._process_focal_peripheral(image)
+        
+        # Add one-hot encoded data type column
+        tensor = self._add_data_type_column(processed_image, 'image')
+        
+        # Add sequence dimension
+        return tensor.unsqueeze(0)
+    
+    def _load_image(self, image_path: str) -> np.ndarray:
+        """Load image from file path."""
+        try:
+            # Try PIL first
+            image = Image.open(image_path)
+            return np.array(image)
+        except:
+            try:
+                # Try OpenCV
+                image = cv2.imread(image_path)
+                if image is not None:
+                    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    raise ValueError(f"Could not load image from: {image_path}")
+            except:
+                raise ValueError(f"Failed to load image from: {image_path}")
+    
+    def _process_focal_peripheral(self, image: np.ndarray) -> torch.Tensor:
+        """Process image distinguishing focal (central 4x4) from peripheral areas."""
+        target_height, target_width, target_channels = self.target_shape
+        
+        if len(image.shape) == 2:
+            # Grayscale image
+            resized = cv2.resize(image, (target_width, target_height))
+            # Convert to 3-channel by repeating
+            resized = np.stack([resized] * 3, axis=-1)
+        else:
+            # Color image
+            resized = cv2.resize(image, (target_width, target_height))
+            
+            # Ensure 3 channels
+            if resized.shape[-1] == 1:
+                resized = np.concatenate([resized] * 3, axis=-1)
+            elif resized.shape[-1] == 4:
+                resized = resized[:, :, :3]  # Remove alpha channel
+        
+        # Convert to tensor
+        tensor = torch.from_numpy(resized).float().to(self.device)
+        tensor = self._normalize_image(tensor)
+        
+        return tensor
+    
+    def _normalize_image(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Normalize image tensor to [0, 1] range."""
+        if tensor.max() > 1.0:
+            tensor = tensor / 255.0
+        return tensor
+    
+    def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
+        """Add one-hot encoded data type column to the left of the tensor."""
+        # Create one-hot encoded column
+        one_hot = torch.tensor(DATA_TYPES[data_type], dtype=torch.float32, device=self.device)
+        one_hot = one_hot.unsqueeze(0).expand(12, -1)  # Shape: (12, 3)
+        
+        # Concatenate along width dimension (dim=1)
+        # Original tensor: (12, 12, 3), one_hot: (12, 1, 3)
+        one_hot = one_hot.unsqueeze(1)  # Shape: (12, 1, 3)
+        result = torch.cat([one_hot, tensor], dim=1)  # Shape: (12, 13, 3)
         
         return result
 
@@ -907,201 +900,6 @@ class TabularProcessor:
         )
         
         return peripheral_tensor
-
-class GraphProcessor:
-    """
-    Processes graph data as tabular data with neighbor and node attribute summarization.
-    Left peripheral view contains neighbor summaries, right peripheral view contains node attribute summaries.
-    """
-    
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
-        """
-        Initialize graph processor.
-        
-        Args:
-            target_shape: Target tensor shape (height, width, channels)
-            device: PyTorch device
-            tokenizer: Optional binary tokenizer for text processing
-        """
-        self.target_height, self.target_width, self.target_channels = target_shape
-        self.device = device
-        
-        # Initialize tabular processor for base processing
-        if tokenizer is None:
-            self.tabular_processor = TabularProcessor(target_shape, device)
-        else:
-            self.tabular_processor = TabularProcessor(target_shape, device, tokenizer)
-    
-    def process(self, graph_input: Union[nx.Graph, np.ndarray, List[List]]) -> torch.Tensor:
-        """
-        Process graph input to target tensor shape.
-        
-        Args:
-            graph_input: Graph as NetworkX object, adjacency matrix, or edge list
-            
-        Returns:
-            Tensor of shape (target_height, target_width+1, target_channels)
-        """
-        # Convert to NetworkX graph if needed
-        if isinstance(graph_input, np.ndarray):
-            # Assume it's an adjacency matrix
-            graph = nx.from_numpy_array(graph_input)
-        elif isinstance(graph_input, list):
-            # Assume it's an edge list
-            graph = nx.from_edgelist(graph_input)
-        else:
-            graph = graph_input
-        
-        # Convert graph to tabular representation
-        tabular_data = self._graph_to_tabular(graph)
-        
-        # Process using tabular processor
-        tensor = self.tabular_processor.process(tabular_data)
-        
-        # Add graph-specific peripheral summarization
-        tensor = self._add_graph_peripheral_summaries(tensor, graph)
-        
-        return tensor
-    
-    def _graph_to_tabular(self, graph: nx.Graph) -> pd.DataFrame:
-        """Convert graph to tabular representation."""
-        # Extract node attributes
-        node_attrs = {}
-        for node in graph.nodes():
-            attrs = graph.nodes[node]
-            node_attrs[node] = attrs
-        
-        # Extract edge attributes
-        edge_attrs = {}
-        for edge in graph.edges():
-            attrs = graph.edges[edge]
-            edge_attrs[edge] = attrs
-        
-        # Create tabular representation
-        # This is a simplified approach - in practice you'd want more sophisticated conversion
-        data = []
-        
-        # Add node information
-        for node, attrs in node_attrs.items():
-            row = [f"node_{node}"]
-            for key, value in attrs.items():
-                row.append(f"{key}_{value}")
-            data.append(row)
-        
-        # Add edge information
-        for edge, attrs in edge_attrs.items():
-            row = [f"edge_{edge[0]}_{edge[1]}"]
-            for key, value in attrs.items():
-                row.append(f"{key}_{value}")
-            data.append(row)
-        
-        # Pad rows to consistent length
-        max_len = max(len(row) for row in data)
-        for row in data:
-            while len(row) < max_len:
-                row.append("")
-        
-        return pd.DataFrame(data)
-    
-    def _add_graph_peripheral_summaries(self, tensor: torch.Tensor, graph: nx.Graph) -> torch.Tensor:
-        """Add graph-specific peripheral summarization."""
-        # Extract the main tensor (without data type column)
-        main_tensor = tensor[:, 1:, :]
-        
-        # Calculate neighbor and node attribute summaries
-        neighbor_summaries = self._calculate_neighbor_summaries(graph)
-        node_attr_summaries = self._calculate_node_attribute_summaries(graph)
-        
-        # Reshape summaries to fit peripheral views
-        neighbor_summary_tensor = self._reshape_summaries_to_peripheral(neighbor_summaries, 'neighbor')
-        node_attr_summary_tensor = self._reshape_summaries_to_peripheral(node_attr_summaries, 'node_attr')
-        
-        # Combine main tensor with peripheral views
-        result = torch.cat([neighbor_summary_tensor, main_tensor, node_attr_summary_tensor], dim=1)
-        
-        # Add data type column back
-        data_type_col = tensor[:, 0:1, :]
-        result = torch.cat([data_type_col, result], dim=1)
-        
-        return result
-    
-    def _calculate_neighbor_summaries(self, graph: nx.Graph) -> np.ndarray:
-        """Calculate neighbor-related summaries for each node."""
-        summaries = []
-        for node in graph.nodes():
-            neighbors = list(graph.neighbors(node))
-            if neighbors:
-                # Calculate neighbor statistics
-                neighbor_degrees = [graph.degree(n) for n in neighbors]
-                summary = [
-                    len(neighbors),  # Number of neighbors
-                    np.mean(neighbor_degrees) if neighbor_degrees else 0,  # Average neighbor degree
-                    np.std(neighbor_degrees) if neighbor_degrees else 0,   # Std of neighbor degrees
-                    max(neighbor_degrees) if neighbor_degrees else 0       # Max neighbor degree
-                ]
-            else:
-                summary = [0.0, 0.0, 0.0, 0.0]
-            summaries.append(summary)
-        
-        return np.array(summaries)
-    
-    def _calculate_node_attribute_summaries(self, graph: nx.Graph) -> np.ndarray:
-        """Calculate node attribute summaries."""
-        summaries = []
-        for node in graph.nodes():
-            attrs = graph.nodes[node]
-            if attrs:
-                # Extract numeric attributes
-                numeric_attrs = []
-                for value in attrs.values():
-                    try:
-                        numeric_attrs.append(float(value))
-                    except (ValueError, TypeError):
-                        continue
-                
-                if numeric_attrs:
-                    summary = [
-                        np.mean(numeric_attrs),
-                        np.std(numeric_attrs),
-                        np.min(numeric_attrs),
-                        np.max(numeric_attrs)
-                    ]
-                else:
-                    summary = [0.0, 0.0, 0.0, 0.0]
-            else:
-                summary = [0.0, 0.0, 0.0, 0.0]
-            summaries.append(summary)
-        
-        return np.array(summaries)
-    
-    def _reshape_summaries_to_peripheral(self, summaries: np.ndarray, summary_type: str) -> torch.Tensor:
-        """Reshape summaries to fit peripheral view dimensions."""
-        if summary_type == 'neighbor':
-            # Left peripheral view: (12, 1, 3)
-            peripheral_width = 1
-        else:
-            # Right peripheral view: (12, 1, 3)
-            peripheral_width = 1
-        
-        # Pad or truncate summaries to fit peripheral dimensions
-        target_size = self.target_height * peripheral_width * self.target_channels
-        
-        flat_summaries = summaries.flatten()
-        if len(flat_summaries) < target_size:
-            # Pad with zeros
-            padding = np.zeros(target_size - len(flat_summaries))
-            flat_summaries = np.concatenate([flat_summaries, padding])
-        else:
-            # Truncate
-            flat_summaries = flat_summaries[:target_size]
-        
-        # Reshape to peripheral dimensions
-        peripheral_tensor = torch.tensor(flat_summaries, dtype=torch.float32).reshape(
-            self.target_height, peripheral_width, self.target_channels
-        )
-        
-        return peripheral_tensor
-
 
 class BatchProcessor:
     """Processor for batch inputs."""

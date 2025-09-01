@@ -115,16 +115,19 @@ class SphericalMesh:
 
         rad_grid, lon_grid, lat_grid = np.meshgrid(radii, lon_angles, lat_angles, indexing='ij')
 
-        rad_flat = rad_grid.reshape(-1)
-        lat_flat = lat_grid.reshape(-1)
-        lon_flat = lon_grid.reshape(-1)
-        points_np = np.stack([rad_flat, lat_flat, lon_flat], axis=1)
+        rad_flat = rad_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        lat_flat = lat_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        lon_flat = lon_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        points_np = np.stack([rad_flat, lat_flat, lon_flat], axis=-1)
 
         indices_np = points_np.copy()
         return points_np, indices_np
 
     def _cartesian_coordinates_np(self, points_np: np.ndarray) -> np.ndarray:
         """Compute Cartesian coordinates from spherical (lat, lon) using NumPy only."""
+
+        points_np = points_np.reshape((-1,3))
+
         rad = points_np[:, 0]
         lon = points_np[:, 1]
         lat = points_np[:, 2]
@@ -134,11 +137,14 @@ class SphericalMesh:
 
     def _spherical_coordinates_np(self, points_np: np.ndarray) -> np.ndarray:
         """Return spherical coordinates (r, theta, phi) using NumPy only."""
+
+        points_np = points_np.reshape((-1,3))
+
         x = points_np[:, 0]
         y = points_np[:, 1]
         z = points_np[:, 2]
 
-        rad, lon, lat = cartesian2spherical(x, y, zero_from_primal)
+        rad, lon, lat = cartesian2spherical(x, y, z)
         return np.stack([rad, lon, lat], axis=1).astype(self.r_dtype, copy=False)
         
     def _generate_mesh(self) -> Tuple:
@@ -149,12 +155,18 @@ class SphericalMesh:
     def _cartesian_coordinates(self):
         """Compute Cartesian coordinates via NumPy, then convert; kept for API compatibility."""
         points_np, _ = self._generate_mesh_np()
-        return self._to_backend(self._cartesian_coordinates_np(points_np))
+
+        shape = points_np.shape
+
+        return self._to_backend(self._cartesian_coordinates_np(points_np)).reshape(shape)
     
     def _spherical_coordinates(self):
         """Compute spherical coordinates via NumPy, then convert; kept for API compatibility."""
         points_np, _ = self._generate_mesh_np()
-        return self._to_backend(self._spherical_coordinates_np(points_np))
+
+        shape = points_np.shape
+
+        return self._to_backend(self._spherical_coordinates_np(points_np)).reshape(shape)
     
     def get_mesh_shape(self) -> Tuple[int, int]:
         """Get the shape of the mesh (n_lat, n_lon)."""
@@ -203,35 +215,14 @@ class SphericalMesh:
             else:
                 pole_valid = np.ones_like(center_valid, dtype=bool)
             return center_valid & pole_valid
-    
-    def get_mesh_tensor(self, feature_dim: int = 1):
-        """
-        Get the mesh as a tensor with additional feature dimensions.
-        
-        Args:
-            feature_dim: Number of feature dimensions to add
-            
-        Returns:
-            Mesh tensor of shape (n_points, 3 + feature_dim)
-        """
-        if self.library == "torch":
-            features = torch.zeros(self.get_total_points(), feature_dim, device=self.device)
-            return torch.cat([self.cartesian_coords, features], dim=1)
-        elif self.library == "jax":
-            features = jnp.zeros((self.get_total_points(), feature_dim))
-            return jnp.concatenate([self.cartesian_coords, features], axis=1)
-        else:
-            features = np.zeros((self.get_total_points(), feature_dim), dtype=float)
-            return np.concatenate([self.cartesian_coords, features], axis=1)
 
     def plot_points(
         self,
         coord_system: str = "spherical",
         sample: Optional[int] = None,
         point_size: Union[int, float] = 0.1,
-        color: Union[str, Tuple[float, float, float]] = "royalblue",
+        color: Union[str, Tuple[float, float, float]] = "blue",
         alpha: float = 0.8,
-        figsize: Tuple[int, int] = (800, 800),
         title: Optional[str] = None,
         save_path: Optional[str] = "meshgrid.html"
     ):
@@ -244,7 +235,6 @@ class SphericalMesh:
             point_size: Marker size for the scatter.
             color: Color for points (name like "royalblue" or RGB/RGBA tuple).
             alpha: Point transparency.
-            figsize: Figure size in pixels as (width, height).
             title: Optional plot title.
             save_path: If provided, save to HTML (if path ends with .html) or to an image
                 format supported by Plotly's Kaleido (e.g., .png, .jpg). Requires `kaleido` for images.
@@ -267,6 +257,7 @@ class SphericalMesh:
         else:
             points_np = np.asarray(self.points)
 
+        points_np = points_np.reshape((-1,3))
         num_points = points_np.shape[0]
 
         # Optional subsampling
@@ -309,12 +300,7 @@ class SphericalMesh:
             marker=dict(size=point_size, color=marker_color, opacity=alpha)
         )
 
-        fig = go.Figure(data=[scatter])
-        fig.update_layout(
-            width=int(figsize[0]),
-            height=int(figsize[1]),
-            title=title
-        )
+        fig = go.Figure(data=[scatter], title = title)
 
         if save_path:
             if save_path.lower().endswith(".html"):

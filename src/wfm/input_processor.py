@@ -7,15 +7,34 @@ into sequences of 12x12x3 dimensional tensors for the foundation model.
 
 import torch
 from transformers import AutoTokenizer, AutoModel
-from typing import Union, List, Tuple, Optional, Dict, Any, Sequence
+from typing import Union, List, Tuple, Optional, Dict, Any
 import numpy as np
+try:
+    from pykeops.numpy import LazyTensor as LazyTensor_np
+    from pykeops.torch import LazyTensor as LazyTensor_torch
+except ModuleNotFoundError:
+    from .utils import LazyTensor_np, LazyTensor_torch
+from .utils import batch_generator
+from .base import *
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import normalize as sk_normalize
+from sklearn.decomposition import TruncatedSVD
+from torch.nn.functional import normalize as torch_normalize
+import ftfy
 from PIL import Image
 import cv2
 import librosa
 import warnings
-from sklearn.cluster import AgglomerativeClustering
 import polars as pl
 import os
+import logging
+import json
+from copy import deepcopy
+import gc
+from tqdm import tqdm
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Suppress librosa warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='librosa')
@@ -31,6 +50,157 @@ DATA_TYPES = [
     "code"
 ]
 
+def windowsort_clustering(X: np.ndarray | torch.Tensor, metric: str, points_per_cluster: int, verbose: bool = False, **kwargs):
+    """
+    Windowsort clustering algorithm.
+    """
+    logger.info(f"Windowsort clustering of {X.shape[0]} points in {X.shape[1]} dimensions")
+    
+    eps = 1e-6
+    if isinstance(X, np.ndarray):
+        X = X.astype(np.float16)
+    else:
+        X = X.numpy().astype(np.float16)
+
+    last_center = X[0].reshape(1, -1)
+    
+    cl = np.arange(X.shape[0], dtype = np.int32).reshape(-1, 1)
+    batch_size = points_per_cluster
+
+    while batch_size > 5:
+        cl = np.concatenate([cl, np.zeros((X.shape[0], 1), dtype = np.int32)], axis = 1)
+        if verbose:
+            logging.info(f"Windowsort clustering iteration with batch size {batch_size}")
+            progress = tqdm(enumerate(batch_generator(X[cl[:,-2],:], batch_size)), desc = "Windowsort clustering", total = X.shape[0] + batch_size - 1 // batch_size)
+        else:
+            progress = enumerate(batch_generator(X[cl[:,-2],:], batch_size))
+
+        for i, batch in progress:
+            local_sims = 1 / (cdist(batch, last_center, metric = metric) + eps)
+            cl[i * batch_size:(i + 1) * batch_size, -1] = local_sims.squeeze().argsort() + i * batch_size
+            last_center = np.median(batch, axis = 0, keepdims = True).astype(np.float16)
+
+        cl[:,-1] = cl[cl[:,-1], -2]
+
+        batch_size = batch_size * 2 // 3
+
+    return cl[:,-1].argsort() // points_per_cluster
+
+def kmeans_clustering(x, points_per_cluster=100, Niter=10, metric="euclidean", verbose=True):
+
+    if isinstance(x, np.ndarray):
+        LazyTensor = LazyTensor_np
+        norm_op = sk_normalize
+    else:
+        LazyTensor = LazyTensor_torch
+        norm_op = torch_normalize
+
+    N, D = x.shape  # Number of samples, dimension of the ambient space
+    n_clusters = (N + points_per_cluster - 1) // points_per_cluster
+    if metric in ["cosine", "cos"]:
+        x = norm_op(x)
+
+    if isinstance(x, np.ndarray):
+        x = x.astype(np.float16)
+    else:
+        x = x.to(dtype = torch.float16)
+
+    # K-means loop:
+    # - x  is the point cloud,
+    # - cl is the vector of class labels
+    # - c  is the cloud of cluster centroids    
+    c = x[:n_clusters, :].copy() if isinstance(x, np.ndarray) else x[:n_clusters, :].detach().clone() # Simplistic random initialization
+    x_i = LazyTensor(x)  # (N, D)
+    source_capacities = np.ones(N)
+    sink_capacities = np.ones(n_clusters) * points_per_cluster
+    number_of_ones = min(sum(source_capacities), sum(sink_capacities))
+
+    for i in range(Niter):
+        if metric in ["euclidean", "l2"]:
+            c_j = LazyTensor(c)  # (n_clusters, D)
+            D_ij = ((x_i - c_j) ** 2).sum(
+                -1
+            )  # (Npoints, Nclusters) symbolic matrix of squared distances
+        elif metric in ["cosine", "cos"]:
+            c_j = LazyTensor(c)
+            D_ij = -1* (x_i @ c_j.T)  # (Npoints, Nclusters) symbolic matrix of cosine distances
+        else:
+            raise ValueError(f"Metric {metric} not supported, supported metrics are: 'euclidean', 'cosine'")
+
+        flow = LazyTensor(np.zeros((N, n_clusters)).astype(np.int8))
+        current_total_flow = 0
+        while current_total_flow < number_of_ones:
+            actual_cost = D_ij * (1 - flow)
+            K = min(points_per_cluster, number_of_ones - flow.sum())
+            minimal_cost_paths = np.unravel_index(actual_cost.argKmin(K), (N, n_clusters))
+            minimal_cost_paths = tuple(arr[np.unique(minimal_cost_paths[0], return_index=True)[1]] for arr in minimal_cost_paths)
+            flow[minimal_cost_paths] = 1
+            row_mask = flow.sum(axis = 1) >= source_capacities
+            column_mask = flow.sum(axis = 0) >= sink_capacities
+            D_ij[row_mask, :] = 1e6 # High value but not infinity due to multiplication with 0
+            D_ij[:, column_mask] = 1e6 # High value but not infinity due to multiplication with 0
+            current_total_flow = flow.sum()
+
+        cl = flow.argmax(axis = 1)
+        cl = cl.astype(np.int8) if isinstance(x, np.ndarray) else cl.to(dtype = torch.int8)
+
+        Ncl = np.bincount(cl, minlength=n_clusters).astype(np.int8) if isinstance(x, np.ndarray) else torch.bincount(cl, minlength=n_clusters).to(dtype = torch.int8)
+
+        for d in range(D):  # Compute the cluster centroids with np.bincount:
+            num = np.bincount(cl, weights=x[:, d]).astype(np.float16) if isinstance(x, np.ndarray) else torch.bincount(cl, weights=x[:, d]).to(dtype = torch.float16)
+            c[:, d] = num / Ncl
+
+    if verbose:
+        print(
+            "K-means example with {:,} points in dimension {:,}, K = {:,}:".format(
+                N, D, n_clusters
+            )
+        )
+
+    return cl, c
+
+def kmeans_hierarchical_clustering(X: np.ndarray, metric: str, points_per_cluster: int, **kwargs):
+
+    logger.info(f"K-Means hierarchical clustering of {X.shape[0]} points in {X.shape[1]} dimensions")
+    
+    cl = np.arange(X.shape[0]).reshape(-1, 1)            
+    
+    centers = X
+    i = 0
+    while len(np.unique(cl[:, -1])) > 2:
+        centers = centers[:, i*(points_per_cluster-1):(i+1)*(points_per_cluster-1)]
+        cl_level, centers = kmeans_clustering(centers, points_per_cluster, metric = metric, verbose = False, **kwargs)
+        cl_level = cl_level[cl[:, -1]] # Map to the initial points recursively
+        cl = np.concatenate([cl, cl_level.reshape(-1, 1)], axis = 1)
+        i += 1
+
+    return cl
+
+
+def kmeans_hierarchical_clustering_parallel(X: np.ndarray, metric: str, points_per_cluster: int, sparse: bool = False, num_workers: int = 2, verbose: bool = False, **kwargs):
+
+    if isinstance(x, np.ndarray):
+        X = X.astype(np.float16)
+    else:
+        X = X.numpy().astype(np.float16)
+
+    if sparse and num_workers > 1:
+        fold = np.random.randint(0, points_per_cluster, X.shape[0])
+        X_folds = [X[fold == k] for k in range(points_per_cluster)]
+        with ProcessPoolExecutor(max_workers = num_workers) as executor:
+            if verbose:
+                logging.info("Clustering", len(X_folds), "folds with parallel", num_workers, "workers")
+            pool_results = [
+                executor.submit(kmeans_hierarchical_clustering, X_k, metric, points_per_cluster, **kwargs) for X_k in X_folds
+            ]
+        pool_results = [result.result() for result in as_completed(pool_results)]
+        cl = [np.concatenate([cl_k, np.full((cl_k.shape[0], 1), k)], axis = 1) for k, cl_k in enumerate(pool_results)]
+        cl = np.concatenate(cl, axis = 0)
+        return cl
+
+    cl = kmeans_hierarchical_clustering(X, metric, points_per_cluster, **kwargs)
+    return cl
+
 
 class InputProcessor:
     """
@@ -44,7 +214,7 @@ class InputProcessor:
     - Right peripheral view: node attributes/column summaries
     """
     
-    def __init__(self, target_shape: Tuple[int, int, int] = (4, 4, 3), base_model: str = "utter-project/EuroLLM-1.7B-Instruct", code_model: str = "google/codegemma-2b", device: Optional[torch.device | str] = None):
+    def __init__(self, target_shape: Tuple[int, int, int] = (4, 4, 3), base_model: str = "utter-project/EuroLLM-1.7B-Instruct", code_model: str = "google/codegemma-2b", library: str = "numpy", device: Optional[torch.device | str] = None):
         """
         Initialize the input processor.
         
@@ -53,15 +223,17 @@ class InputProcessor:
             device: PyTorch device (defaults to CPU)
         """
         self.target_shape = target_shape
+        self.target_width, self.target_height, self.target_channels = target_shape
+        self.library = library
         self.device = device or torch.device('cpu')
 
         # Initialize text-based processors with shared tokenizer
         self.text_binary_tokenizer = BinaryTokenizer(
             base_tokenizer=base_model, 
             base_embedder=base_model, 
-            binary_dim=16  # 4**2 for focus patch size
+            binary_dim=self.target_width*self.target_height
         )
-        self.text_processor = TextProcessor(target_shape, self.device, self.text_binary_tokenizer)
+        self.text_processor = TextProcessor(target_shape, self.device, self.text_binary_tokenizer, library = "numpy")
         
         # Initialize specialized processors
         self.image_processor = ImageProcessor(target_shape, self.device)
@@ -161,7 +333,7 @@ class BinaryTokenizer:
     Tokens are encoded as binary vectors stored as base-10 integers.
     """
     
-    def __init__(self, base_tokenizer, base_embedder, binary_dim: int = 16):
+    def __init__(self, base_tokenizer, base_embedder: Optional[str] = None, load_from: Optional[str] = None, binary_dim: int = 16, cluster_size: int = 2, use_svd: bool = True, clustering_algorithm: str = "windowsort", verbose: bool = True):
         """
         Initialize the binary tokenizer.
         
@@ -174,8 +346,22 @@ class BinaryTokenizer:
         if not np.sqrt(binary_dim).is_integer():
             raise ValueError("Binary dimension must be a perfect square")
 
+        if base_embedder is None and isinstance(base_tokenizer, str):
+            base_embedder = base_tokenizer
+
+        self.base_name = base_tokenizer.split("/")[-1] if isinstance(base_tokenizer, str) else base_tokenizer.name_or_path.split("/")[-1]
         self.base_tokenizer = AutoTokenizer.from_pretrained(base_tokenizer) if isinstance(base_tokenizer, str) else base_tokenizer
-        self.base_embedder = AutoModel.from_pretrained(base_embedder) if isinstance(base_embedder, str) else base_embedder
+        embedder = AutoModel.from_pretrained(base_embedder) if isinstance(base_embedder, str) else base_embedder
+        if hasattr(embedder, 'embed_tokens'):
+            self.base_embedder = deepcopy(embedder.embed_tokens)
+        elif hasattr(embedder, 'embeddings'):
+            self.base_embedder = deepcopy(embedder.embeddings.word_embeddings)
+        else:
+            raise ValueError("Base embedder must have an embed_tokens or embeddings.word_embeddings attribute")
+
+        del embedder
+        gc.collect()
+
         self.vocab_size = 8**binary_dim
         self.binary_dim = binary_dim
         self.L = int(np.sqrt(binary_dim))
@@ -183,8 +369,44 @@ class BinaryTokenizer:
         self.binary_to_token = {}
         self.token_embeddings = None
         self.cluster_labels = None
-        self._build_binary_vocabulary()
-    
+        num_cpus = os.cpu_count() | 2
+        self.num_workers = num_cpus // 2
+        self.cluster_size = cluster_size
+        self.use_svd = use_svd
+        self.clustering_algorithm = clustering_algorithm
+        self.verbose = verbose
+
+        if load_from:
+            try:
+                self.load_binary_vocabulary(load_from)
+            except FileNotFoundError:
+                self._build_binary_vocabulary()
+        else:
+            self._build_binary_vocabulary()
+
+        # Ensure PAD token is number 0
+        pad_token_number = self.token_to_binary.get(self.base_tokenizer.pad_token, max(self.token_to_binary.values()) + 1)
+        zeroth_token = self.binary_to_token.get(0)
+        self.binary_to_token[0] = self.base_tokenizer.pad_token
+        self.token_to_binary[self.base_tokenizer.pad_token] = 0
+        if zeroth_token:
+            self.binary_to_token[pad_token_number] = zeroth_token
+            self.token_to_binary[zeroth_token] = pad_token_number
+
+        self.special_tokens = list(self.base_tokenizer.special_tokens_map.values()) + [f"<{category}>" for category in DATA_TYPES] + [f"</{category}>" for category in DATA_TYPES]
+
+    def save_binary_vocabulary(self, save_to: str):
+        """Save binary vocabulary to file."""
+        with open(save_to, "w", encoding = "utf-8") as f:
+            json.dump({k: int(v) for k,v in self.token_to_binary.items()}, f)
+
+    def load_binary_vocabulary(self, load_from: str):
+        """Load binary vocabulary from file."""
+        with open(load_from, "r", encoding = "utf-8") as f:
+            d = json.load(f)
+        self.token_to_binary = {ftfy.fix_text(k): v for k, v in d.items()}
+        self.binary_to_token = {v: k for k, v in self.token_to_binary.items()}
+
     def _build_binary_vocabulary(self):
         """Build binary vocabulary using hierarchical clustering on base tokenizer embeddings."""
         # Get embeddings from base tokenizer
@@ -193,32 +415,83 @@ class BinaryTokenizer:
         else:
             vocab = list(self.base_tokenizer.vocab.keys())
 
-        extended_vocab = vocab + [f"<{category}>" for category in DATA_TYPES] + [f"</{category}>" for category in DATA_TYPES] + list(self.base_tokenizer.special_tokens_dict.keys())
+        extended_vocab = vocab + [w for w in self.special_tokens if w not in vocab]
         self.extended_vocab = extended_vocab[-1:-self.vocab_size-1:-1]
         
         # Get embeddings
-        W = self.base_embedder.weight.data.numpy()
+        W = self.base_embedder.weight.data.numpy().astype(np.float16)
         if W.shape[0] < W.shape[1]:
             W = W.T
         embeddings = W[-1:-len(vocab)-1:-1]
         embeddings = np.concatenate([
-            np.random.randn(len(self.extended_vocab) - len(vocab), W.shape[1]),
+            np.random.randn(len(self.extended_vocab) - len(vocab), W.shape[1]).astype(np.float16),
             embeddings
         ], axis = 0)
         
-        # Perform hierarchical clustering
-        clustering = AgglomerativeClustering(min(self.vocab_size, len(self.extended_vocab)))
-        cluster_labels = clustering.fit_predict(embeddings)
+        cluster_labels = self._tree_clustering(
+            embeddings,
+            cluster_size = self.cluster_size,
+            metric = "cosine"
+        )
         
         # Assign binary codes based on clustering
         self._assign_binary_codes(self.extended_vocab, cluster_labels)
-    
+
+        shape = (self.L, self.L, 3)
+        self.save_binary_vocabulary(f"vocab_{self.base_name}_{"x".join(map(str, shape))}_{self.clustering_algorithm}_{self.cluster_size}.json")
+
+
+    def _tree_clustering(self, X: np.ndarray, cluster_size: int, metric: str):
+        """
+        Hierarchical clustering algorithm that avoids computing all pairwise distances.
+        Uses an incremental approach to build a binary tree where each leaf contains
+        exactly cluster_size data points.
+        
+        Args:
+            X: Input data array of shape (n_samples, n_features)
+            cluster_size: Target number of points per leaf cluster
+            metric: Distance metric to use ('cosine', 'euclidean', etc.)
+            
+        Returns:
+            cluster_labels: Array of cluster labels for each data point
+        """
+        logger.info(f"Re-clustering data points ensuring each leaf cluster contains exactly {cluster_size} points")
+        
+        n_samples, n_features = X.shape
+        
+        # If we have fewer samples than cluster_size, return single cluster
+        if n_samples <= cluster_size:
+            return np.zeros(n_samples, dtype=int)
+
+        N_levels = np.ceil(np.log(n_samples) / np.log(cluster_size)).astype(int)
+
+        if self.verbose:
+            logging.info(f"Performing randomized SVD with {N_levels * max(1, cluster_size - 1)} components")
+        svd = TruncatedSVD(n_components = N_levels * max(1, cluster_size - 1), algorithm = "randomized", n_oversamples = cluster_size, n_iter = 10)
+        # Randomized SVD is faster than ARPACK but less accurate
+        X_svd = svd.fit_transform(X) if self.use_svd else X
+                
+        if self.clustering_algorithm == "windowsort":
+            clusters = windowsort_clustering(X_svd, metric, cluster_size,verbose = self.verbose).astype(int)
+        else:
+            clusters = kmeans_hierarchical_clustering_parallel(X_svd, metric, cluster_size, sparse = True, num_workers = self.num_workers, verbose = self.verbose).astype(int)
+            # clusters is a 2D array of shape (n_samples, n_tree_levels)
+            flattened_labels = clusters[:,1:] * cluster_size**np.arange(clusters.shape[1]-1) 
+            clusters = flattened_labels.sum(axis = 1)
+        
+        return clusters
+
     def _assign_binary_codes(self, vocab: List[str], cluster_labels: np.ndarray):
         """Assign binary codes to tokens based on clustering."""
+
+        logger.info(f"Assigning binary codes to {len(vocab)} tokens based on clustering")
         
-        for i, (token, cluster_id) in enumerate(zip(vocab, cluster_labels)):
-            self.token_to_binary[token] = cluster_id
-            self.binary_to_token[cluster_id] = token
+        zipped = list(zip(vocab, cluster_labels))
+        zipped.sort(key=lambda x: x[1])
+        for i, (token, cluster_id) in enumerate(zipped):
+            id_ = cluster_id * self.cluster_size + i % self.cluster_size
+            self.token_to_binary[token] = id_
+            self.binary_to_token[id_] = token
     
     def encode(self, texts: str | List[str]) -> List[int]:
         """Encode text to list of binary integer codes."""
@@ -227,52 +500,61 @@ class BinaryTokenizer:
             texts = [texts]
 
         # Tokenize with base tokenizer
-        if hasattr(self.base_tokenizer, 'encode'):
-            tokenized_texts = self.base_tokenizer.encode(texts)
-        else:
-            tokenized_texts = self.base_tokenizer.tokenize(texts)
-
-        max_seq_length = max(len(encoding) for encoding in tokenized_texts)
+        tokenized_texts = self.base_tokenizer(texts, padding = True, return_tensors = "np").input_ids
+        max_seq_length = tokenized_texts.shape[1]
         
         # Convert to binary codes
         binary_codes = []
         for encoding in tokenized_texts:
             binary_codes.append([])
-            for token in encoding:
+            for token_id in encoding:
+                token = self.base_tokenizer.convert_ids_to_tokens([token_id])[0]
                 if token not in self.token_to_binary:
-                    self.token_to_binary[token] = max(self.token_to_binary.values()) + 1
-                    self.binary_to_token[max(self.token_to_binary.values()) + 1] = token
+                    new_value = max(self.token_to_binary.values()) + 1
+                    self.token_to_binary[token] = new_value
+                    self.binary_to_token[new_value] = token
 
                 binary_codes[-1].append(
-                    np.fromstring(np.binary_repr(self.token_to_binary[token], self.binary_dim*3, signed = False), dtype = "S1").astype(np.int8)
+                    np.fromstring(np.binary_repr(self.token_to_binary[token], self.binary_dim*3), dtype = "S1").astype(np.int8).reshape(self.L, self.L, 3)
                 )
-            binary_codes[-1] = np.pad(binary_codes[-1], (0, max_seq_length - len(encoding)), mode = 'constant')
-
-        binary_codes = np.array(binary_codes, dtype = np.int8).reshape(-1, max_seq_length, self.L, self.L, 3)
+            binary_codes[-1] = np.pad(binary_codes[-1], ((0, max_seq_length - len(encoding)), (0, 0), (0, 0), (0, 0)), mode = 'constant', constant_values = 0)
         # shape: (batch_size, sequence_length, L, L, 3)
         
-        return binary_codes
+        return np.asarray(binary_codes)
     
-    def decode(self, binary_codes: List[List[int | np.ndarray]]) -> str:
+    def decode(self, binary_codes: List[List[int | np.ndarray]], print_special_tokens: bool = False, return_list: bool = False) -> str | List[str]:
         """Decode binary integer codes back to text."""
-        decoded_texts = []
-        for encoding in binary_codes:
-            text = ""
+        decoded_texts = [""] * len(binary_codes)
+        powers_of_two = 2**np.arange(self.binary_dim*3, dtype = np.int64)[::-1]
+        for i, encoding in enumerate(binary_codes):
             for code in encoding:
                 if isinstance(code, int):
                     token_id = code
                 else:
-                    token_id = code.reshape(-1).dot(2**np.arange(self.binary_dim*3))
+                    token_id = code.reshape(-1).dot(powers_of_two)
 
                 new_token = self.binary_to_token.get(token_id, '<???>')
-                if new_token.startswith("Ġ") or new_token.startswith("#"):
-                    text += new_token[1:]
+                if new_token in self.special_tokens:
+                    if print_special_tokens:
+                        if return_list:
+                            decoded_texts[i] += " "
+                        decoded_texts[i] += new_token
+                elif (new_token.startswith("Ġ") or new_token.startswith("#")) and not return_list:
+                    decoded_texts[i] += new_token[1:]
+                elif new_token.startswith("▁") and not return_list:
+                    decoded_texts[i] += new_token.replace("▁", " ", 1)
+                elif return_list:
+                    new_token_with_space = " " + new_token
+                    decoded_texts[i] += new_token_with_space
                 else:
-                    text += " " + new_token
+                    decoded_texts[i] += new_token
 
-            decoded_texts.append(text.strip())
+            decoded_texts[i] = decoded_texts[i].strip()
         
-        return decoded_texts
+        if return_list:
+            return [text.split() for text in decoded_texts]
+        else:
+            return decoded_texts
     
 
 class TextProcessor:
@@ -280,7 +562,7 @@ class TextProcessor:
     Processes text data using binary tokenization.
     """
     
-    def __init__(self, target_shape: Tuple[int, int, int], device: torch.device, tokenizer: Optional[BinaryTokenizer] = None):
+    def __init__(self, target_shape: Tuple[int, int, int] = None, device: torch.device = torch.device("cpu"), library: str = "numpy", tokenizer: Optional[BinaryTokenizer] = None, tokenizer_kwargs: Optional[Dict] = {}):
         """
         Initialize text processor.
         
@@ -289,28 +571,30 @@ class TextProcessor:
             device: PyTorch device
             tokenizer: Optional pre-initialized binary tokenizer
         """
+        if target_shape is None:
+            if tokenizer is None:
+                raise ValueError("Target shape must be provided if no tokenizer is provided")
+            else:
+                L = int(np.sqrt(tokenizer.binary_dim))
+                target_shape = (L, L, 3)
+
         self.target_height, self.target_width, self.target_channels = target_shape
         self.device = device
+        self.library = library.lower()
+
+        if self.library not in ALLOWED_LIBRARIES:
+            raise ValueError(f"Invalid library: {self.library}, must be one of {ALLOWED_LIBRARIES}")
         
-        # Initialize default tokenizer if none provided
-        if tokenizer is None:
-            # Create a mock tokenizer for demonstration
-            # In practice, you'd load a real multilingual tokenizer
-            self.tokenizer = self._create_mock_tokenizer()
-        else:
+        if isinstance(tokenizer, str):
+            self.tokenizer = BinaryTokenizer(tokenizer, **tokenizer_kwargs)
+        elif isinstance(tokenizer, BinaryTokenizer):
             self.tokenizer = tokenizer
-    
-    def _create_mock_tokenizer(self) -> BinaryTokenizer:
-        """Create a mock tokenizer for demonstration purposes."""
-        class MockTokenizer:
-            def __init__(self):
-                self.vocab = {f"token_{i}": i for i in range(1000)}
-            
-            def get_vocab(self):
-                return self.vocab
-        
-        return BinaryTokenizer(MockTokenizer())
-    
+        else:
+            raise ValueError(f"Text tokenizer must be a string or a BinaryTokenizer instance, got {type(tokenizer)}")
+
+        assert self.target_height * self.target_width * self.target_channels == self.tokenizer.binary_dim * 3, "Target shape must be compatible with binary dimension, i.e. target_height * target_width * target_channels = binary_dim * 3"
+
+
     def process(self, text_input: Union[str, List[str]]) -> torch.Tensor:
         """
         Process text input to target tensor shape.
@@ -323,51 +607,24 @@ class TextProcessor:
         """
         if isinstance(text_input, str):
             text_input = [text_input]
+
+        text_input = ["<text>"+ s + "</text>" for s in text_input]
         
         # Get binary matrix from tokenizer
-        binary_matrix = self.tokenizer.get_binary_matrix(' '.join(text_input))
-        
-        # Reshape to target dimensions
-        tensor = self._reshape_to_target(binary_matrix)
-        
-        # Add data type column
-        tensor = self._add_data_type_column(tensor, 'text')
-        
-        return tensor.to(self.device)
-    
-    def _reshape_to_target(self, binary_matrix: torch.Tensor) -> torch.Tensor:
-        """Reshape binary matrix to target dimensions."""
-        # Flatten binary matrix
-        flat_binary = binary_matrix.flatten()
-        
-        # Pad or truncate to fit target dimensions
-        target_size = self.target_height * self.target_width * self.target_channels
-        
-        if len(flat_binary) < target_size:
-            # Pad with zeros
-            padding = torch.zeros(target_size - len(flat_binary))
-            flat_binary = torch.cat([flat_binary, padding])
+        binary_tensor = self.tokenizer.encode(text_input)
+        # shape = (batch_size, sequence_length+2, L, L, 3)
+        binary_tensor_padded = np.pad(binary_tensor, ((0,0), (1,1), (0,0), (0,0), (0,0)))
+        # shape = (batch_size, sequence_length+4, L, L, 3)
+
+        if self.library == "torch":
+            return torch.from_numpy(binary_tensor_padded).to(self.device)
         else:
-            # Truncate
-            flat_binary = flat_binary[:target_size]
-        
-        # Reshape to target dimensions
-        tensor = flat_binary.reshape(self.target_height, self.target_width, self.target_channels)
-        
-        return tensor
-    
-    def _add_data_type_column(self, tensor: torch.Tensor, data_type: str) -> torch.Tensor:
-        """Add data type column to tensor."""
-        # Create data type column (12, 1, 3)
-        data_type_col = torch.zeros(self.target_height, 1, self.target_channels)
-        
-        # Set one-hot encoding for text
-        data_type_col[:, 0, 0] = 1.0  # Text type
-        
-        # Concatenate with original tensor
-        result = torch.cat([data_type_col, tensor], dim=1)
-        
-        return result
+            return binary_tensor_padded
+
+    def convert_ids_to_tokens(self, ids: torch.Tensor | np.ndarray) -> List[str]:
+        """Convert binary integer codes back to text."""
+
+        return self.tokenizer.decode(ids, print_special_tokens = True, return_list = True)
 
 
 class ImageProcessor:
@@ -773,7 +1030,7 @@ class TabularProcessor:
         else:
             self.text_processor = TextProcessor(target_shape, device, tokenizer)
     
-    def process(self, tabular_input: Union[pd.DataFrame, np.ndarray, List[List]]) -> torch.Tensor:
+    def process(self, tabular_input: Union[pl.DataFrame, np.ndarray, List[List]]) -> torch.Tensor:
         """
         Process tabular input to target tensor shape.
         
@@ -785,9 +1042,9 @@ class TabularProcessor:
         """
         # Convert to DataFrame if needed
         if isinstance(tabular_input, np.ndarray):
-            df = pd.DataFrame(tabular_input)
+            df = pl.DataFrame(tabular_input)
         elif isinstance(tabular_input, list):
-            df = pd.DataFrame(tabular_input)
+            df = pl.DataFrame(tabular_input)
         else:
             df = tabular_input
         
@@ -800,7 +1057,7 @@ class TabularProcessor:
         
         return tensor
     
-    def _tabular_to_text(self, df: pd.DataFrame) -> str:
+    def _tabular_to_text(self, df: pl.DataFrame) -> str:
         """Convert tabular data to text representation."""
         # Convert DataFrame to text format
         text_lines = []
@@ -814,7 +1071,7 @@ class TabularProcessor:
         
         return '\n'.join(text_lines)
     
-    def _add_peripheral_summaries(self, tensor: torch.Tensor, df: pd.DataFrame) -> torch.Tensor:
+    def _add_peripheral_summaries(self, tensor: torch.Tensor, df: pl.DataFrame) -> torch.Tensor:
         """Add peripheral view summarization to tensor."""
         # Extract the main tensor (without data type column)
         main_tensor = tensor[:, 1:, :]
@@ -836,12 +1093,12 @@ class TabularProcessor:
         
         return result
     
-    def _calculate_row_summaries(self, df: pd.DataFrame) -> np.ndarray:
+    def _calculate_row_summaries(self, df: pl.DataFrame) -> np.ndarray:
         """Calculate summary statistics for each row."""
         summaries = []
         for _, row in df.iterrows():
             # Calculate basic statistics for the row
-            numeric_vals = pd.to_numeric(row, errors='coerce').dropna()
+            numeric_vals = pl.to_numeric(row, errors='coerce').dropna()
             if len(numeric_vals) > 0:
                 summary = [
                     numeric_vals.mean(),
@@ -855,11 +1112,11 @@ class TabularProcessor:
         
         return np.array(summaries)
     
-    def _calculate_column_summaries(self, df: pd.DataFrame) -> np.ndarray:
+    def _calculate_column_summaries(self, df: pl.DataFrame) -> np.ndarray:
         """Calculate summary statistics for each column."""
         summaries = []
         for col in df.columns:
-            numeric_vals = pd.to_numeric(df[col], errors='coerce').dropna()
+            numeric_vals = pl.to_numeric(df[col], errors='coerce').dropna()
             if len(numeric_vals) > 0:
                 summary = [
                     numeric_vals.mean(),

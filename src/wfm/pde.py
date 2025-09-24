@@ -6,13 +6,11 @@ differential equations over spherical meshes.
 """
 
 import torch
-from torch._dynamo.polyfills import NoEnterTorchFunctionMode
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, Optional, Callable, Union, Dict, Any
+from typing import Optional, Callable, Union, Dict, Any
 import numpy as np
 from .spherical_mesh import SphericalMesh
 from .functional import FitzhughNagumo
+from .base import *
 
 REACTION_FUNCTIONS = {
     "fitzhugh-nagumo": FitzhughNagumo,

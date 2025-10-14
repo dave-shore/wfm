@@ -72,6 +72,7 @@ class SphericalMesh:
         self.max_radius = radius
         self.n_lat = n_lat
         self.n_lon = n_lon
+        self.shape = (n_radial, n_lat, n_lon)
         self.exclude_poles = (pole_exclusion_angle > 0.0)
         self.pole_exclusion_angle = pole_exclusion_angle
         self.center_exclusion_radius = center_exclusion_radius
@@ -92,6 +93,10 @@ class SphericalMesh:
         points_np, indices_np = self._generate_mesh_np()
         self.points = self._to_backend(points_np)
         self.indices = self._to_backend(indices_np)
+
+    def get_boundary_points(self):
+        """Get the boundary points of the mesh."""
+        return (self.points[0,:,:], self.points[-1,:,:], self.points[:,0,:], self.points[:,-1,:], self.points[:,:,0], self.points[:,:,-1])
 
     def _to_backend(self, array_np: np.ndarray):
         """Convert a NumPy array to the selected backend (torch/jax/numpy)."""

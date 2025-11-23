@@ -5,30 +5,77 @@ from scipy import ndimage
 import jax
 import jax.numpy as jnp
 from tqdm import trange
-from typing import Tuple, Dict, Any, Optional, Callable, List
+from itertools import chain
+import gc
+from typing import Tuple, Dict, Any, Optional, Callable, List, Union
 from .spherical_mesh import SphericalMesh
 from .base import *
 
 
+def fit_tensor_shape(tensor: torch.Tensor, desired_shape: Tuple[int, ...]) -> torch.Tensor:
+    """
+    Reshape a tensor to a desired shape by tiling (if smaller) or slicing (if larger).
+    
+    Args:
+        tensor: Input tensor to reshape
+        desired_shape: Target shape tuple
+        
+    Returns:
+        Tensor with the desired shape, obtained by tiling or slicing the input tensor
+    """
+    if tensor.shape == desired_shape:
+        return tensor
+    
+    result = tensor.clone()
+    
+    for dim, desired_size in enumerate(desired_shape):
+        current_size = result.shape[dim]
+        
+        if current_size < desired_size:
+            # Need to tile/repeat to expand
+            # Calculate how many times we need to repeat
+            repeat_factor = (desired_size + current_size - 1) // current_size  # Ceiling division
+            result = torch.repeat_interleave(result, repeats=repeat_factor, dim=dim)
+            # Slice to exact desired size
+            result = result.narrow(dim, 0, desired_size)
+            
+        elif current_size > desired_size:
+            # Need to downsample by taking evenly spaced elements
+            # Use linspace to get evenly distributed indices
+            indices = torch.linspace(0, current_size - 1, desired_size, device=result.device).long()
+            result = torch.index_select(result, dim, indices)
+    
+    return result
+
+
 def get_jacobian_on_field(func: torch.Tensor | jnp.ndarray | np.ndarray | Callable, field: torch.Tensor | jnp.ndarray | np.ndarray, interpolation_factor: int = 4, **kwargs):
+
+    field = field.squeeze()
 
     if not isinstance(func, Callable):
         field_out_dim = field.shape[-1]
         return func.reshape(1,1,1, field_out_dim, field_out_dim)
 
-    field = field[::interpolation_factor, ::interpolation_factor, ::interpolation_factor, :]
+    field_shape = field.shape[:-1]
+    field_out_dim = field.shape[-1]
+    start_idx = (
+        (field_shape[0] % interpolation_factor) // 2, 
+        (field_shape[1] % interpolation_factor) // 2, 
+        (field_shape[2] % interpolation_factor) // 2
+    )
+    field = field[start_idx[0]::interpolation_factor, start_idx[1]::interpolation_factor, start_idx[2]::interpolation_factor, :]
+    field_reduced_shape = field.shape[:-1]
     
     if hasattr(func, "library"):
-        field_shape = field.shape
-        field = field.reshape(-1, field_shape[-1])
+        field = field.reshape(-1, field_out_dim)
         if func.library == "torch":
             J = torch.cat([
                 torch.func.vmap(
                     torch.func.jacfwd(func)
                 )(field[i:i+BASE_BATCH_SIZE], **kwargs)
                 for i in range(0, field.shape[0], BASE_BATCH_SIZE)
-            ], dim = 0).reshape(*field_shape[:-1], field_shape[-1], field_shape[-1])
-            return torch.nn.functional.interpolate(J, scale_factor = (interpolation_factor, interpolation_factor, interpolation_factor), mode = "trilinear")
+            ], dim = 0).reshape(*field_reduced_shape, field_out_dim, field_out_dim)
+            return torch.nn.functional.interpolate(J.permute(4,3,2,1,0), size = field_shape[::-1], mode = "trilinear").permute(4,3,2,1,0)
 
         elif func.library == "jax":
             J = jnp.concatenate([
@@ -36,15 +83,15 @@ def get_jacobian_on_field(func: torch.Tensor | jnp.ndarray | np.ndarray | Callab
                     jax.jacfwd(func)
                 )(field[i:i+BASE_BATCH_SIZE], **kwargs)
                 for i in range(0, field.shape[0], BASE_BATCH_SIZE)
-            ], axis = 0).reshape(*field_shape[:-1], field_shape[-1], field_shape[-1])
-            return jax.nn.interpolate(J, scale_factor = (interpolation_factor, interpolation_factor, interpolation_factor), mode = "trilinear")
+            ], axis = 0).reshape(*field_reduced_shape, field_out_dim, field_out_dim)
+            return jax.nn.interpolate(J.transpose(4,3,2,1,0), size = field_shape[::-1], mode = "trilinear").transpose(4,3,2,1,0)
 
         else:
             J = np.concatenate([
                 np.gradient(func(field[i:i+BASE_BATCH_SIZE], **kwargs), axis = -1)
                 for i in range(0, field.shape[0], BASE_BATCH_SIZE)
-            ], axis = 0).reshape(*field_shape[:-1], field_shape[-1], field_shape[-1])
-            return ndimage.interpolation.zoom(J, scale = (interpolation_factor, interpolation_factor, interpolation_factor), mode = "trilinear")
+            ], axis = 0).reshape(*field_reduced_shape, field_out_dim, field_out_dim)
+            return ndimage.interpolation.zoom(J.transpose(4,3,2,1,0), size = field_shape[::-1], mode = "trilinear").transpose(4,3,2,1,0)
 
     else:
         J = np.gradient(func(np.asarray(field), **kwargs), axis = -1)
@@ -128,6 +175,8 @@ class SphericalCrankNicolson():
             self.roll = torch.roll
             self.concat = torch.cat
             self.solve = torch.linalg.lstsq
+            self.full = torch.full
+
         elif mesh.library == "jax":
             self.local_dx = jnp.stack([jnp.diff(x[...,i], axis = i, prepend = jnp.zeros_like(x.select(i, 0)).expand_dims(i)[...,i]) for i in range(x.shape[-1])], axis = -1)
             self.sin = jnp.sin
@@ -135,6 +184,8 @@ class SphericalCrankNicolson():
             self.roll = jnp.roll
             self.concat = jnp.cat
             self.solve = jnp.linalg.lstsq
+            self.full = jnp.full
+
         else:
             self.local_dx = np.stack([np.diff(x[...,i], axis = i, prepend = np.zeros_like(x.select(i, 0)).expand_dims(i)[...,i]) for i in range(x.shape[-1])], axis = -1)
             self.sin = np.sin
@@ -142,7 +193,7 @@ class SphericalCrankNicolson():
             self.roll = np.roll
             self.concat = np.concatenate
             self.solve = np.linalg.lstsq
-
+            self.full = np.full
 
     def __call__(
         self, 
@@ -166,12 +217,12 @@ class SphericalCrankNicolson():
         else:
             boundary_conditions = dirichlet_bc
 
-        output = torch.empty((time_steps+1,size_1, size_2, size_3, field_dim), device = self.mesh.device)
-        output[0] = U_initial
+        output = torch.empty((time_steps+1,size_1-2, size_2-2, size_3-2, field_dim), device = self.mesh.device)
 
         # Exclude boundary points
         U_curr = U_initial[1:-1,1:-1,1:-1,:]
         # shape = (x-2, y-2, z-2, 3)
+        output[0] = U_curr
         U_prev = torch.zeros_like(U_curr) if isinstance(U_initial, torch.Tensor) else jnp.zeros_like(U_curr) if isinstance(U_initial, jnp.ndarray) else np.zeros_like(U_curr)
         # shape = (x-2, y-2, z-2, 3)
 
@@ -184,6 +235,9 @@ class SphericalCrankNicolson():
         inv_h0 = H[..., [0], :]**(-1)
         inv_h1 = H[..., [1], :]**(-1)
         inv_h2 = H[..., [2], :]**(-1)
+        inv_h0[inv_h0 > UB] = UB
+        inv_h1[inv_h1 > UB] = UB
+        inv_h2[inv_h2 > UB] = UB
 
         laplacian_coefficients = (
             1,
@@ -201,6 +255,36 @@ class SphericalCrankNicolson():
             X[..., [0], :]**(-1) * (self.sin(X[..., [1], :]) + EPS)**(-1),
         )
 
+        tensor_boundary_conditions = []
+        for i,bc in enumerate(boundary_conditions):
+            shape_to_fit = [time_steps, size_1-2, size_2-2, size_3-2, field_dim]
+            shape_to_fit[i+1] = 1
+            tensor_boundary_conditions.append([])
+            for j,b in enumerate(bc):
+                if isinstance(b, torch.Tensor | jnp.ndarray | np.ndarray):
+                    B = fit_tensor_shape(b, tuple(shape_to_fit))
+
+                elif isinstance(b, float):
+                    B = self.full(tuple(shape_to_fit), b, device = U_curr.device)[:time_steps]
+
+                elif b is None:
+                    B = U_curr.select(i, -j)
+                    B = B.reshape(1, *shape_to_fit[1:]).repeat(shape_to_fit[0], 1, 1, 1, 1)
+
+                elif isinstance(b, Callable):
+                    B = b(self.mesh.points.select(i, 0 + j*self.mesh.shape[i])).reshape(tuple(shape_to_fit))[:time_steps]
+                else:
+                    B = b
+
+                if hasattr(B, "reshape"):
+                    B = B.reshape(*B.shape, 1)
+
+                # shape = (time_steps, size_1-2, size_2-2, size_3-2, 3, 1) where one of the sizes becomes 1
+
+                tensor_boundary_conditions[i].append(B)
+        
+        gc.collect()
+
         for n in trange(time_steps):
             V = get_jacobian_on_field(velocity_term, U_curr)
             D = get_jacobian_on_field(diffusion_term, U_curr)
@@ -209,7 +293,12 @@ class SphericalCrankNicolson():
 
             next_coefficient = 1 / k**2 + V / k 
             curr_centered_coefficient = torch.zeros_like(U_curr) if isinstance(U_curr, torch.Tensor) else jnp.zeros_like(U_curr) if isinstance(U_curr, jnp.ndarray) else np.zeros_like(U_curr)
-            curr_centered_coefficient = curr_centered_coefficient.reshape(*curr_centered_coefficient.shape, curr_centered_coefficient.shape[-1])
+            if curr_centered_coefficient.dim() < 5:
+                curr_centered_coefficient = curr_centered_coefficient.reshape(*curr_centered_coefficient.shape, 1)
+            elif curr_centered_coefficient.dim() > 5:
+                curr_centered_coefficient = curr_centered_coefficient.squeeze()
+
+            curr_centered_coefficient = curr_centered_coefficient.repeat(1, 1, 1, 1, field_dim)
             curr_centered_coefficient += 2 / (k**2)
             curr_centered_coefficient += V / k
             curr_centered_coefficient -= inv_h0*laplacian_gradient_coefficients[0]*D
@@ -236,29 +325,60 @@ class SphericalCrankNicolson():
             curr_up_coefficient += inv_h2*gradient_coefficients[2]*A
             curr_down_coefficient = inv_h2**2*laplacian_coefficients[2]*D
 
+            if U_curr.dim() < 5:
+                U_curr = U_curr.reshape(*U_curr.shape, 1)
+            elif U_curr.dim() > 5:
+                U_curr = U_curr.squeeze()
+            
+            if U_prev.dim() < 5:
+                U_prev = U_prev.reshape(*U_curr.shape)
+            elif U_prev.dim() > 5:
+                U_prev = U_prev.squeeze()
+
             int_term = self.concat([
-                boundary_conditions[0][0],
-                curr_int_coefficient[:-1,:,:] * U_curr[:-1,:,:]
+                tensor_boundary_conditions[0][0][n],
+                curr_int_coefficient[:-1,:,:] @ U_curr[:-1,:,:]
             ])
             ext_term = self.concat([
-                boundary_conditions[0][1],
-                curr_ext_coefficient[1:,:,:] * U_curr[1:,:,:]
+                curr_ext_coefficient[1:,:,:] @ U_curr[1:,:,:],
+                tensor_boundary_conditions[0][1][n]
             ])
-            right_term = self.roll(curr_right_coefficient*U_curr, shifts = (0,-1,0), dims = 1)
-            left_term = self.roll(curr_left_coefficient*U_curr, shifts = (0,1,0), dims = 1)
+            right_term = self.roll(curr_right_coefficient @ U_curr, shifts = -1, dims = 1)
+            left_term = self.roll(curr_left_coefficient @ U_curr, shifts = 1, dims = 1)
             up_term = self.concat([
-                boundary_conditions[2][0],
-                curr_up_coefficient[:-1,:,:] * U_curr[:-1,:,:]
-            ])
+                curr_up_coefficient[:,:,:-1] @ U_curr[:,:,:-1],
+                tensor_boundary_conditions[2][1][n]
+            ], axis = 2)
             down_term = self.concat([
-                boundary_conditions[2][1],
-                curr_down_coefficient[1:,:,:] * U_curr[1:,:,:]
-            ])
+                tensor_boundary_conditions[2][0][n],
+                curr_down_coefficient[:,:,1:] @ U_curr[:,:,1:]
+            ], axis = 2)
             prev_coefficient = -k**(-2)
 
             explicit_term = curr_centered_coefficient*U_curr + prev_coefficient*U_prev + int_term + ext_term + right_term + left_term + up_term + down_term
-            U_next = self.solve(next_coefficient, explicit_term)
-            output[n+1] = torch.as_tensor(U_next.solution if hasattr(U_next, "solution") else U_next[0])
+            # shape = (size_1-2, size_2-2, size_3-2, 3, 3)
+            U_next = torch.sum(next_coefficient.transpose(-1,-2) * explicit_term, dim = -1)
+            output[n+1] = U_next
+            U_prev = U_curr
+            U_curr = U_next
+
+        for i, bc in enumerate(tensor_boundary_conditions):
+            # Apply zero-padding on both sides of dimensions 0 through i (inclusive)
+            # Padding format for torch.nn.functional.pad goes from last dimension backwards:
+            # (pad_left_dim_n, pad_right_dim_n, pad_left_dim_n-1, pad_right_dim_n-1, ...)
+            num_dims = len(output.shape)
+            pad_tuple = sum([[1, int(dim > 0)] if dim <= i else [0, 0] for dim in range(num_dims)], [])[::-1]
+            
+            padded_bc0 = torch.nn.functional.pad(bc[0].squeeze(-1), pad_tuple, mode='constant', value=0)
+            padded_bc1 = torch.nn.functional.pad(bc[1].squeeze(-1), pad_tuple, mode='constant', value=0)
+            
+            output = torch.cat([padded_bc0, output, padded_bc1], dim = i+1)
+
+        output = torch.nn.functional.interpolate(
+            output.transpose(-1,1), 
+            size = self.mesh.shape[-1::-1], 
+            mode = "trilinear"
+        ).transpose(-1,1)
 
         if self.mesh.library == "torch":
             return output

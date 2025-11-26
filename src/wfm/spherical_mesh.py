@@ -32,8 +32,48 @@ def cartesian2spherical(x, y, z):
 
     return rad, lon, lat
 
+class GenericMesh():
 
-class SphericalMesh:
+    def __init__(self, radius: float = 1.0, n_radial: int = 100, n_lat: int = 180, n_lon: int = 360, exclude_poles: bool = True, pole_exclusion_angle: float = 0.1, center_exclusion_radius: float = 0.05, library: str = "numpy", dtype = np.complex64, device: Optional[torch.device] = None):
+
+        self.n_radial = n_radial
+        self.max_radius = radius
+        self.n_lat = n_lat
+        self.n_lon = n_lon
+        self.shape = (n_radial, n_lat, n_lon)
+        self.exclude_poles = (pole_exclusion_angle > 0.0)
+        self.pole_exclusion_angle = pole_exclusion_angle
+        self.center_exclusion_radius = center_exclusion_radius
+        self.library = library.lower() if library in ALLOWED_LIBRARIES else "numpy"
+        self.c_dtype = dtype
+        self.r_dtype = getattr(np, f"float{np.nbytes[dtype] // 2 * 8}")
+        if self.library == "torch":
+            self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        elif self.library == "jax":
+            try:
+                self.device = jax.devices("gpu")[0]
+            except RuntimeError:
+                self.device = jax.devices("cpu")[0]
+        else:
+            self.device = "cpu"
+
+    def get_boundary_points(self):
+        """Get the boundary points of the mesh."""
+        return (self.points[0,:,:], self.points[-1,:,:], self.points[:,0,:], self.points[:,-1,:], self.points[:,:,0], self.points[:,:,-1])
+
+    def _to_backend(self, array_np: np.ndarray):
+        """Convert a NumPy array to the selected backend (torch/jax/numpy)."""
+        
+        if self.library == "torch":
+            t = torch.from_numpy(array_np)
+            return t.to(self.device) if isinstance(self.device, torch.device) else t
+        elif self.library == "jax":
+            return jax.device_put(array_np, self.device) if self.device is not None else jnp.array(array_np)
+        else:
+            return array_np
+
+
+class SphericalMesh(GenericMesh):
     """
     A 3D spherical mesh centered at [0,0,0] with collision avoidance.
     
@@ -68,46 +108,12 @@ class SphericalMesh:
             library: Can be "numpy", "torch", or "jax"
             device: PyTorch device for tensor operations
         """
-        self.n_radial = n_radial
-        self.max_radius = radius
-        self.n_lat = n_lat
-        self.n_lon = n_lon
-        self.shape = (n_radial, n_lat, n_lon)
-        self.exclude_poles = (pole_exclusion_angle > 0.0)
-        self.pole_exclusion_angle = pole_exclusion_angle
-        self.center_exclusion_radius = center_exclusion_radius
-        self.library = library.lower() if library in ALLOWED_LIBRARIES else "numpy"
-        self.c_dtype = dtype
-        self.r_dtype = getattr(np, f"float{np.nbytes[dtype] // 2 * 8}")
-        if self.library == "torch":
-            self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        elif self.library == "jax":
-            try:
-                self.device = jax.devices("gpu")[0]
-            except RuntimeError:
-                self.device = jax.devices("cpu")[0]
-        else:
-            self.device = "cpu"
+        super().__init__(radius, n_radial, n_lat, n_lon, exclude_poles, pole_exclusion_angle, center_exclusion_radius, library, dtype, device)
         
         # Generate mesh and coordinates in NumPy, then convert once to the selected backend
         points_np, indices_np = self._generate_mesh_np()
         self.points = self._to_backend(points_np)
         self.indices = self._to_backend(indices_np)
-
-    def get_boundary_points(self):
-        """Get the boundary points of the mesh."""
-        return (self.points[0,:,:], self.points[-1,:,:], self.points[:,0,:], self.points[:,-1,:], self.points[:,:,0], self.points[:,:,-1])
-
-    def _to_backend(self, array_np: np.ndarray):
-        """Convert a NumPy array to the selected backend (torch/jax/numpy)."""
-        
-        if self.library == "torch":
-            t = torch.from_numpy(array_np)
-            return t.to(self.device) if isinstance(self.device, torch.device) else t
-        elif self.library == "jax":
-            return jax.device_put(array_np, self.device) if self.device is not None else jnp.array(array_np)
-        else:
-            return array_np
 
     def _generate_mesh_np(self) -> Tuple[np.ndarray, np.ndarray]:
         """Generate mesh latitude/longitude points and indices using NumPy only."""

@@ -102,7 +102,7 @@ class RandNetTorch(nn.Module):
     Shallow random neural network used to estimate the delta between a coarse integrator (e.g. Runge-Kutta 1) and the actual solution of a differential equation.
     """
 
-    def __init__(self, field_out_size: int, time_steps: int, mesh_size: Tuple[int, int, int], mesh_sampling_rate: int  | Tuple[int, int, int] = 1, device: torch.device = torch.device("cpu"), max_U_norm: float = 1.0, regularization_lambda: float = 0.1, optimizer_kwargs: Dict[str, Any] = {"lr": 1e-3, "weight_decay": 1e-4}):
+    def __init__(self, field_out_size: int, time_steps: int, mesh_size: Tuple[int, int, int], mesh_sampling_rate: int  | Tuple[int, int, int] = 1, device: torch.device = torch.device("cpu"), max_U_norm: float = 1.0, regularization_lambda: float = 0.1, optimizer_kwargs: Dict[str, Any] = {"lr": 1e-3, "weight_decay": 1e-4}, hidden_size: int = 256):
 
         super().__init__()
 
@@ -118,10 +118,31 @@ class RandNetTorch(nn.Module):
         self.loss_fn = nn.MSELoss()
         self.optimizer = torch.optim.AdamW(self.net.parameters(), **optimizer_kwargs)
         self.regularization_lambda = regularization_lambda
+        self.k = 1
+        self.hidden_size = hidden_size
 
-        self.input_size = (field_out_size, time_steps, mesh_size[0] // self.mesh_sampling_rate[0], mesh_size[1] // self.mesh_sampling_rate[1], mesh_size[2] // self.mesh_sampling_rate[2])
-        # shape = (3, 6L, 100, 360, 180)
-        self.input_size_flat = int(np.prod(self.input_size))
+        self.input_size = (self.k*time_steps, field_out_size, mesh_size[0], mesh_size[1], mesh_size[2])
+        # shape = (k*L, 3, 100, 360, 180)
+
+        padding_dims = tuple(mesh_size[i] % mesh_sampling_rate[i] for i in range(len(mesh_size)))
+        paddings = tuple((padding_dims[i] // 2, padding_dims[i] - padding_dims[i] // 2) for i in range(len(padding_dims)))
+
+        self.simplify_3d_space = nn.Sequential(
+            nn.Conv3d(
+                in_channels = field_out_size,
+                out_channels = field_out_size,
+                kernel_size = mesh_sampling_rate,
+                padding = paddings,
+                stride = mesh_sampling_rate,
+                bias = False,
+                device = device
+            ),
+            nn.Dropout(0.1),
+            nn.BatchNorm3d(field_out_size)
+        )
+
+        self.conv_output_size = (self.input_size[0], self.input_size[1], (self.input_size[2] + padding_dims[0]) // self.mesh_sampling_rate[0], (self.input_size[3] + padding_dims[1]) // self.mesh_sampling_rate[1], (self.input_size[4] + padding_dims[2]) // self.mesh_sampling_rate[2])
+        self.input_size_flat = int(np.prod(self.conv_output_size[1:]))
 
         self.net = nn.Sequential(
             nn.ReLU(),
@@ -130,46 +151,84 @@ class RandNetTorch(nn.Module):
         )
 
         self.residual = nn.Sequential(
-            nn.Linear(self.input_size_flat, self.input_size_flat),
+            nn.Linear(self.input_size_flat, self.hidden_size),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(self.input_size_flat, self.input_size_flat),
-            nn.BatchNorm1d(self.input_size_flat)
+            nn.Linear(self.hidden_size, self.input_size_flat)
         )
 
         self.A = torch.randn(self.input_size_flat, self.input_size_flat, device = self.device)
-        self.A = self.A / torch.norm(self.A, dim = 1, keepdim = True)
+        self.A = self.rho * self.A / torch.norm(self.A, dim = 1, keepdim = True)
         self.Z = torch.distributions.Uniform(-self.max_Z_abs, self.max_Z_abs).sample((self.input_size_flat,1)).to(self.device)
 
     def forward(self, U: torch.Tensor):
 
-        if U.dim() < 5:
+        if U.dim() < 6:
             U = U.unsqueeze(0)
 
-        initial_shape = U.shape
+        if U.shape[-1] == self.field_out_size:
+            U = U.permute(0,1,5,2,3,4)
 
-        assert U.shape[1:] == self.input_size, f"Input tensor must have shape (*,{self.input_size}), got {U.shape}"
-        U_flat = U.flatten(start_dim = 1)
+        initial_shape = U.shape
+        # shape = (k, L, 3, 100, 360, 180)
+
+        U_D = U.flatten(start_dim = 0, end_dim = 1)
+
+        assert U.shape[1:] == self.input_size[1:], f"Input tensor must have shape (*,{self.input_size}), except for dim 0, but got {U.shape}"
+
+        U_reduced = self.simplify_3d_space(U_D)
+        U_flat = torch.flatten(U_reduced, start_dim = 1)
         U_hat = self.net(U_flat @ self.A + self.Z)
         U_tilde = self.residual(U_flat)
 
-        Y = torch.nn.functional.glu(torch.cat([U_tilde, U_hat], dim = -1)) 
+        Y = torch.nn.functional.glu(torch.cat([U_hat, U_tilde], dim = -1)) 
+        Y = Y.reshape(self.conv_output_size)
+        Y = torch.nn.functional.interpolate(Y, size = self.input_size[2:], mode = "trilinear")
 
-        return Y.reshape(initial_shape)
+        return Y.permute(0,2,3,4,1)
 
-    def _update_parameters(self, U: torch.Tensor, U_hat: Optional[torch.Tensor] = None):
+    def _update_parameters(self, U: torch.Tensor, Y: Optional[torch.Tensor] = None):
+        """
+        In a cycle, the model is expected to receive initially the coarse solution (e.g. CrankNicolson) and a fine solution (e.g. RungeKutta8). The model is trained to estimate the delta between the two. At subsequent cycles, it is no more necessary to provide the fine solution, as the model uses the previous estimates to compute the next one.
+        """
 
-        if U_hat is None:
-            U_hat = self.forward(U)
+        if Y is None:
+            if U.shape[0] > 1:
+                Y = U[1:]
+                U = U[:-1]
+            else:
+                raise ValueError("U must have at least 2 time steps")
 
         self.optimizer.zero_grad(set_to_none = True)
-        loss = self.loss_fn(U_hat, U) + self.regularization_lambda * self.net[1].weight.norm()
+        U_hat = self.forward(U)
+        loss = self.loss_fn(U + U_hat, Y) + self.regularization_lambda * self.net[-1].weight.norm()
         loss.backward()
-
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm = 1.0)
         self.optimizer.step()
 
-        return loss.item()
+        return U + U_hat, loss.item()
 
+    def train_delta_estimator(self, U_initial: torch.Tensor, Y_initial: torch.Tensor, n_epochs: int = 100, patience: int = 10, tol: float = 1e-6):
+
+        previous_outputs, losses = [U_initial], []
+        previous_output, loss = self._update_parameters(U_initial, Y_initial)
+        previous_outputs.append(previous_output)
+        losses.append(loss)
+
+        self.train()
+        for epoch in trange(n_epochs, desc = "Training delta estimator"):
+            previous_output, loss = self._update_parameters(
+                torch.cat(previous_outputs[:-1], dim = 0),
+                torch.cat(previous_outputs[1:], dim = 0)
+            )
+            previous_outputs.append(previous_output)
+            losses.append(loss)
+            print(f"Epoch {epoch+1}/{n_epochs}, Loss: {loss.item()}")
+            if len(losses) > patience:
+                if all(l < tol for l in losses[-patience:]):
+                    break
+
+        return losses
 
 class BaseIntegrator():
 
@@ -763,22 +822,20 @@ class Parareal(BaseIntegrator):
         fine_output = fine_integrator(U_initial, time_steps, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc)
         delta_gt = fine_output - coarse_output
 
-        previous_delta = torch.randn_like(coarse_output)
-        previous_delta[0] = torch.zeros_like(previous_delta[0])
-
         optimizer = getattr(torch.optim, optimizer_name)(self.delta_estimator.parameters(), **optimizer_kwargs)
         latest_losses = []
-        noise = torch.zeros_like(previous_delta)
+        previous_output = coarse_output
 
         self.delta_estimator.train()
         for epoch in trange(n_epochs, desc = "Training delta estimator"):
             optimizer.zero_grad()
-            output_delta = self.delta_estimator(previous_delta + noise)
-            loss = torch.norm(output_delta - delta_gt, p = 2, dim = -1).max().item()
+            output_delta = self.delta_estimator(previous_output)
+            fine_output = coarse_output + output_delta
+            loss = torch.norm(fine_output - previous_output, p = 2, dim = -1).max().item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.delta_estimator.parameters(), max_norm = 1.0)
             optimizer.step()
-            previous_delta = output_delta
+            previous_output = fine_output
             print(f"Epoch {epoch+1}/{n_epochs}, Loss: {loss.item()}")
             latest_losses.append(loss.item())
             if len(latest_losses) > patience:
@@ -806,18 +863,16 @@ class Parareal(BaseIntegrator):
 
         coarse_output = self.coarse_integrator(U_initial, time_steps, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc)
 
-        previous_delta = torch.randn_like(coarse_output)
-        previous_delta[0] = torch.zeros_like(previous_delta[0])
         n_iterations = 0
         error = torch.inf
+        previous_output = coarse_output
 
         while error > tol and n_iterations < max_iter:
-            output_delta = self.delta_estimator(previous_delta)
-            error = torch.norm(output_delta - previous_delta, p = 2, dim = -1).max().item()
-            previous_delta = output_delta
+            output_delta = self.delta_estimator(previous_output)
+            fine_output = coarse_output + output_delta
+            error = torch.norm(fine_output - previous_output, p = 2, dim = -1).max().item()
+            previous_output = fine_output
             n_iterations += 1
-
-        fine_output = coarse_output + output_delta
 
         return fine_output
 

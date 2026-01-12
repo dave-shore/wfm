@@ -41,6 +41,7 @@ class GenericMesh():
         self.n_lat = n_lat
         self.n_lon = n_lon
         self.shape = (n_radial, n_lat, n_lon)
+        self.boundary_dims_and_idx = [(i,(0,-1)) for i in range(len(self.shape))]
         self.exclude_poles = (pole_exclusion_angle > 0.0)
         self.pole_exclusion_angle = pole_exclusion_angle
         self.center_exclusion_radius = center_exclusion_radius
@@ -59,7 +60,7 @@ class GenericMesh():
 
     def get_boundary_points(self):
         """Get the boundary points of the mesh."""
-        return (self.points[0,:,:], self.points[-1,:,:], self.points[:,0,:], self.points[:,-1,:], self.points[:,:,0], self.points[:,:,-1])
+        return [tuple(self.points.select(idx, dim = dim) for idx in indices) for dim, indices in self.boundary_dims_and_idx]
 
     def _to_backend(self, array_np: np.ndarray):
         """Convert a NumPy array to the selected backend (torch/jax/numpy)."""
@@ -110,6 +111,8 @@ class SphericalMesh(GenericMesh):
         """
         super().__init__(radius, n_radial, n_lat, n_lon, exclude_poles, pole_exclusion_angle, center_exclusion_radius, library, dtype, device)
         
+        self.boundary_dims_and_idx = [(0,(-1,))]
+
         # Generate mesh and coordinates in NumPy, then convert once to the selected backend
         points_np, indices_np = self._generate_mesh_np()
         self.points = self._to_backend(points_np)

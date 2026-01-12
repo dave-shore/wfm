@@ -135,6 +135,28 @@ def create_peripheral_array_simple(X):
     return result
 
 
+def associated_legendre_transform(X: torch.Tensor | jnp.ndarray | np.ndarray, m: int, l: int) -> torch.Tensor | jnp.ndarray | np.ndarray:
+    """
+    Associated Legendre transform of a set of weights over a set of coordinates.
+    """
+    assert m >= 0
+    assert l >= 0
+    assert m <= l
+
+    k = torch.arange(m, l + 1)
+    b = torch.jit_builtins.math.factorial(k) / torch.jit_builtins.math.factorial(k - m)
+    b = b.reshape(-1,*[1 for _ in range(X.dim())])
+    exp_k = k.reshape(-1,*[1 for _ in range(X.dim())]) - m
+    binom_l_k = torch.jit_builtins.math.factorial(l) / (torch.jit_builtins.math.factorial(k) * torch.jit_builtins.math.factorial(l - k))
+    binom_l_k = binom_l_k.reshape(-1,*[1 for _ in range(X.dim())])
+    l_plus = (k + l - 1) // 2
+    binom_l_plus_l = torch.jit_builtins.math.factorial(l_plus) / (torch.jit_builtins.math.factorial(l_plus - l) * torch.jit_builtins.math.factorial(l))
+    binom_l_plus_l = binom_l_plus_l.reshape(-1,*[1 for _ in range(X.dim())])
+    S = torch.sum(b * binom_l_k * binom_l_plus_l * X.unsqueeze(0)**exp_k, dim = 0)
+
+    return (-1)**m * (2**l) * (1 - X**2)**(m/2) * S
+
+
 def fourier_transform(weights: torch.Tensor | jnp.ndarray | np.ndarray, coords: torch.Tensor | jnp.ndarray | np.ndarray) -> torch.Tensor | jnp.ndarray | np.ndarray:
     """
     Fourier transform of a set of weights over a set of coordinates.
@@ -143,28 +165,40 @@ def fourier_transform(weights: torch.Tensor | jnp.ndarray | np.ndarray, coords: 
     assert weights.dtype == coords.dtype, f"Weights and coords must have the same dtype, got {weights.dtype} and {coords.dtype}."
 
     batch_size, sequence_length, _, fourier_dim, _ = weights.shape
-    mesh_width, mesh_height, _ = coords.shape
+    mesh_width, mesh_height, _ = coords.shape # coords.shape = (mesh_width, mesh_height, 2)
 
     library = "torch" if isinstance(weights, torch.Tensor) else "jax" if isinstance(weights, jnp.ndarray) else "numpy"
 
     cos_function = torch.cos if library == "torch" else jnp.cos if library == "jax" else np.cos
-    frequency_mods = 2*np.pi / (np.arange(weights.shape[-2] // 2) + 1)
-    frequency_mods = frequency_mods.repeat(2).reshape(1,1,-1,1)
+    phi_mods = np.arange(weights.shape[-2]).reshape(1,1,-1,1)
+    theta_mods = np.ones_like(phi_mods)
+    frequency_mods = np.concatenate([theta_mods, phi_mods], axis = -1)
     mod_coords = np.expand_dims(coords, axis = -2) * frequency_mods
     # mod_coords.shape = (mesh_width, mesh_height, fourier_dim, 2)
 
-    mod_coords[:,:,1::2] = np.pi / 2 - mod_coords[:,:,1::2]
     if library == "torch":
         mod_coords = torch.from_numpy(mod_coords)
     elif library == "jax":
         mod_coords = jnp.array(mod_coords)
 
+    legendre_dim = np.sqrt(2 * fourier_dim + 1).ceil()
+    legendre_degrees = np.concatenate([np.arange(1,m+1) for m in range(legendre_dim)])
+    legendre_degrees = legendre_degrees[:fourier_dim]
+
     cosines = cos_function(mod_coords)
     
     if library == "torch":
         cosines = cosines.to(weights.device, dtype = weights.dtype)
+        legendre_degrees = torch.from_numpy(legendre_degrees).to(weights.device, dtype = weights.dtype)
     elif library == "jax":
         cosines = cosines.astype(weights.dtype)
+        legendre_degrees = jnp.array(legendre_degrees).astype(weights.dtype)
+
+    cosines[...,0] = torch.stack([
+        associated_legendre_transform(cosines[:,:,i,0], m = m, l = legendre_degrees[i - m] + 1)
+        if i > 0 else
+        associated_legendre_transform(cosines[:,:,i,0], m = m, l = 1)
+    for i,m in enumerate(legendre_degrees)],dim = -1)
 
     F = torch.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1])) if library == "torch" else jnp.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1])) if library == "jax" else np.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1]))
     # F.shape = (batch_size, sequence_length, 3, mesh_width, mesh_height)

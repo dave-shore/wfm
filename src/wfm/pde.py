@@ -8,7 +8,7 @@ differential equations over spherical meshes.
 import torch
 from typing import Optional, Union, Dict, Any, List, Tuple, Type, Callable
 import numpy as np
-from .spherical_mesh import SphericalMesh
+from .spherical_mesh import GenericMesh, SphericalMesh
 from .functional import FitzhughNagumo
 from .base import *
 import torch.nn as nn
@@ -106,5 +106,86 @@ class PDETorch(nn.Module):
     def set_mesh(self, mesh: SphericalMesh):
         """Set the mesh for discretization."""
         self.mesh = mesh
+
         
+class BoundaryDecoderTorch(nn.Module):
+
+    def __init__(self, mesh, boundary_conditions, kernel_size, output_sizes, dropout: float = 0.1, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.mesh = mesh
+        self.boundary_conditions = boundary_conditions
+        self.dropout = dropout
+
+         # Input to border translation (from encoder to decoder) is of shape (encoder_tokens, 3, *other_dimensions)
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(in_channels = 3, out_channels = 1, kernel_size=kernel_size),
+            nn.BatchNorm2d(1)
+        )
+        # The spatial convolution outputs an encoder_tokens-long sequence of matrices of shape (H,W)
+
+        self.reverse_conv = nn.Sequential(
+            nn.Conv2d(in_channels = 1, out_channels = 3, kernel_size=kernel_size, padding = (2*kernel_size[0]- 2, 2*kernel_size[1]-2), stride = (2,2)),
+            nn.SELU(),
+            nn.Dropout(self.dropout)
+        )
+
+        self.mid_proj = nn.ModuleList([
+            nn.LazyLinear(size) for size in output_sizes
+        ])
+
+    def dbc_generator(self, memory: torch.Tensor, initial_state: torch.Tensor):
+
+        if memory.dim() != 4:
+            raise ValueError(f"Memory has to be a Bilinear Associative Memory tensor of shape (H,W,H,W), instead got {memory.shape}")
+
+        K_H, K_W, V_H, V_W = memory.shape
+        Q = initial_state.reshape(K_H, K_W)
+
+        while True:
+            V = torch.einsum("ij,ijkl->kl", Q, memory).unsqueeze(0)
+            # shape = 1, V_H, V_W
+
+            # Must yield the current DBC (shape = 3, V_H + kernel_size[0] - 1, V_W + kernel_size[1] - 1) and the new Q
+            dbc = self.reverse_conv(V)
+            for dim,proj in enumerate(self.mid_proj):
+                dbc = proj(dbc.transpose(dim, -1)).transpose(dim, -1)
+            yield dbc
+
+            Q += V.squeeze()
+
+
+
+    def forward(self):
+
+        if not isinstance(self.mesh, GenericMesh):
+            raise TypeError("The PDE must have a valid mesh.")
+
+        if not hasattr(self.mesh, "get_boundary_points"):
+            raise AttributeError("The mesh should have the 'get_boundary_points' method accessible")
+        
+        if isinstance(self.boundary_conditions, Callable):
+            boundary_conditions = [tuple(self.boundary_conditions(bp) for bp in tup) for tup in self.mesh.get_boundary_points()]
+        else:
+            boundary_conditions = self.boundary_conditions
+
+        decoder_boundary_conditions = []
+        for encoder_bc in boundary_conditions:
+            decoder_bc = []
+            for ebc in encoder_bc:
+                proj_ebc = self.spatial_conv(ebc.transpose(1,-1)).squeeze()
+                bam = torch.sum(
+                    proj_ebc.unsqueeze(-1).unsqueeze(-1) * proj_ebc.unsqueeze(1).unsqueeze(1),
+                    dim = 0
+                )
+                dbc = 
+                decoder_bc.append(dbc)
+            decoder_boundary_conditions.append(tuple(decoder_bc))
+
+
+        
+
+
+
+
 

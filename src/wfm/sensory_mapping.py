@@ -5,6 +5,7 @@ import torch.nn as nn
 import random
 import jax.numpy as jnp
 import numpy as np
+import math
 
 class SensoryFocusMatrixTorch(nn.Module):
 
@@ -135,6 +136,10 @@ def create_peripheral_array_simple(X):
     return result
 
 
+def factorial(n: float) -> int:
+    return math.factorial(max(0,int(n)))
+
+
 def associated_legendre_transform(X: torch.Tensor | jnp.ndarray | np.ndarray, m: int, l: int) -> torch.Tensor | jnp.ndarray | np.ndarray:
     """
     Associated Legendre transform of a set of weights over a set of coordinates.
@@ -143,14 +148,39 @@ def associated_legendre_transform(X: torch.Tensor | jnp.ndarray | np.ndarray, m:
     assert l >= 0
     assert m <= l
 
-    k = torch.arange(m, l + 1)
-    b = torch.jit_builtins.math.factorial(k) / torch.jit_builtins.math.factorial(k - m)
+    l = int(l)
+    m = int(m)
+
+    k = torch.arange(m, l + 1, dtype = torch.int64)
+    b = torch.prod(torch.stack([k-i for i in range(m)]), dim = 0)
     b = b.reshape(-1,*[1 for _ in range(X.dim())])
     exp_k = k.reshape(-1,*[1 for _ in range(X.dim())]) - m
-    binom_l_k = torch.jit_builtins.math.factorial(l) / (torch.jit_builtins.math.factorial(k) * torch.jit_builtins.math.factorial(l - k))
+    k_min = int(k.min().item())
+    if l - k_min > 0:
+        binom_l_k = torch.prod(
+            torch.stack([
+                torch.where(k + i < l, k + i, 1)
+                for i in range(l - k_min)
+            ]),
+            dim = 0
+        )
+        binom_l_k = binom_l_k / (l-k).apply_(factorial)
+    else:
+        binom_l_k = torch.ones_like(k)
     binom_l_k = binom_l_k.reshape(-1,*[1 for _ in range(X.dim())])
     l_plus = (k + l - 1) // 2
-    binom_l_plus_l = torch.jit_builtins.math.factorial(l_plus) / (torch.jit_builtins.math.factorial(l_plus - l) * torch.jit_builtins.math.factorial(l))
+    l_plus_max = int(l_plus.max().item())
+    if l_plus_max - l > 0:
+        binom_l_plus_l = torch.prod(
+            torch.stack([
+                torch.where(l_plus - i > l, l_plus - i, 1)
+                for i in range(l_plus_max - l)
+            ]),
+            dim = 0
+        )
+        binom_l_plus_l = binom_l_plus_l / (l_plus - l).apply_(factorial)
+    else:
+        binom_l_plus_l = torch.ones_like(l_plus)
     binom_l_plus_l = binom_l_plus_l.reshape(-1,*[1 for _ in range(X.dim())])
     S = torch.sum(b * binom_l_k * binom_l_plus_l * X.unsqueeze(0)**exp_k, dim = 0)
 
@@ -181,7 +211,7 @@ def fourier_transform(weights: torch.Tensor | jnp.ndarray | np.ndarray, coords: 
     elif library == "jax":
         mod_coords = jnp.array(mod_coords)
 
-    legendre_dim = np.sqrt(2 * fourier_dim + 1).ceil()
+    legendre_dim = int(np.ceil(np.sqrt(2 * fourier_dim + 1)).astype(np.int32))
     legendre_degrees = np.concatenate([np.arange(1,m+1) for m in range(legendre_dim)])
     legendre_degrees = legendre_degrees[:fourier_dim]
 
@@ -194,11 +224,11 @@ def fourier_transform(weights: torch.Tensor | jnp.ndarray | np.ndarray, coords: 
         cosines = cosines.astype(weights.dtype)
         legendre_degrees = jnp.array(legendre_degrees).astype(weights.dtype)
 
-    cosines[...,0] = torch.stack([
-        associated_legendre_transform(cosines[:,:,i,0], m = m, l = legendre_degrees[i - m] + 1)
+    cosines = torch.stack([
+        associated_legendre_transform(cosines[:,:,i,:], m = int(m), l = legendre_degrees[i - int(m)].item() + 1)
         if i > 0 else
-        associated_legendre_transform(cosines[:,:,i,0], m = m, l = 1)
-    for i,m in enumerate(legendre_degrees)],dim = -1)
+        associated_legendre_transform(cosines[:,:,i,:], m = int(m), l = 1)
+    for i,m in enumerate(legendre_degrees)], dim = -2)
 
     F = torch.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1])) if library == "torch" else jnp.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1])) if library == "jax" else np.tensordot(weights, cosines, dims = ([-2,-1],[-2,-1]))
     # F.shape = (batch_size, sequence_length, 3, mesh_width, mesh_height)

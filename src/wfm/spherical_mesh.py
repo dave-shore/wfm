@@ -40,7 +40,7 @@ class GenericMesh():
         self.max_radius = radius
         self.n_lat = n_lat
         self.n_lon = n_lon
-        self.shape = (n_radial, n_lat, n_lon)
+        self.shape = (n_radial, n_lon, n_lat)
         self.boundary_dims_and_idx = [(i,(0,-1)) for i in range(len(self.shape))]
         self.exclude_poles = (pole_exclusion_angle > 0.0)
         self.pole_exclusion_angle = pole_exclusion_angle
@@ -127,11 +127,11 @@ class SphericalMesh(GenericMesh):
         lon_angles = np.linspace(0.0, 2 * math.pi, self.n_lon, dtype=self.r_dtype)
         radii = np.linspace(self.center_exclusion_radius, self.max_radius, self.n_radial, dtype = self.r_dtype)
 
-        rad_grid, lon_grid, lat_grid = np.meshgrid(radii, lon_angles, lat_angles, indexing='ij')
+        rad_grid, lat_grid, lon_grid = np.meshgrid(radii, lat_angles, lon_angles, indexing='ij')
 
-        rad_flat = rad_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
-        lat_flat = lat_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
-        lon_flat = lon_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        rad_flat = rad_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
+        lat_flat = lat_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
+        lon_flat = lon_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
         points_np = np.stack([rad_flat, lat_flat, lon_flat], axis=-1)
 
         indices_np = points_np.copy()
@@ -184,7 +184,7 @@ class SphericalMesh(GenericMesh):
     
     def get_mesh_shape(self) -> Tuple[int, int]:
         """Get the shape of the mesh (n_lat, n_lon)."""
-        return (self.n_radial, self.n_lat, self.n_lon)
+        return (self.n_radial, self.n_lon, self.n_lat)
     
     def is_valid_point(self, points, coord_system: str = 'spherical'):
         """

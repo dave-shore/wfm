@@ -155,7 +155,6 @@ class BoundaryDecoderTorch(nn.Module):
             Q += V.squeeze()
 
 
-
     def forward(self):
 
         if not isinstance(self.mesh, GenericMesh):
@@ -178,8 +177,8 @@ class BoundaryDecoderTorch(nn.Module):
                     proj_ebc.unsqueeze(-1).unsqueeze(-1) * proj_ebc.unsqueeze(1).unsqueeze(1),
                     dim = 0
                 )
-                dbc = 
-                decoder_bc.append(dbc)
+                dbc = self.dbc_generator(bam, ebc)
+                decoder_bc.extend([x for x in dbc])
             decoder_boundary_conditions.append(tuple(decoder_bc))
 
 

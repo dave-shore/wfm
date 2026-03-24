@@ -37,17 +37,18 @@ class FieldFunction():
         self.library = library.lower()
         assert self.library in ALLOWED_LIBRARIES
         self.params = []
+        self.dtype = torch.get_default_dtype() if self.library == "torch" else np.float32
 
     def _cast_library(self):
 
         if self.library == "torch":
             for i in range(len(self.params)):
                 param = self.params[i]
-                self.params[i] = torch.nn.Parameter(torch.as_tensor(param) if isinstance(param, (list, np.ndarray)) else param, requires_grad = True)
+                self.params[i] = torch.nn.Parameter(torch.as_tensor(param, dtype = self.dtype) if isinstance(param, (list, np.ndarray)) else param, requires_grad = True)
         
         if self.library == "jax":
             for i in range(len(self.params)):
-                self.params[i] = jnp.asarray(self.params[i])
+                self.params[i] = jnp.asarray(self.params[i], dtype = self.dtype)
 
     def __call__(self, *args, **kwargs):
         pass
@@ -78,6 +79,11 @@ class FitzhughNagumo(FieldFunction):
 
 
     def __call__(self, u: Union[np.ndarray, torch.Tensor, ArrayImpl]) -> Union[np.ndarray, torch.Tensor, ArrayImpl]:
+
+        if self.library == "torch":
+            u = u.to(self.dtype)
+        else:
+            u = u.astype(self.dtype)
         
         if self.dim > 1:
             a = u @ self.gamma
@@ -98,6 +104,11 @@ class LinearDecay(FieldFunction):
 
     def __call__(self, u: Union[np.ndarray, torch.Tensor, ArrayImpl]) -> Union[np.ndarray, torch.Tensor, ArrayImpl]:
 
+        if self.library == "torch":
+            u = u.to(self.dtype)
+        else:
+            u = u.astype(self.dtype)
+
         return -self.rate * u
     
     
@@ -111,6 +122,11 @@ class LogisticGrowth(FieldFunction):
         self._cast_library()
 
     def __call__(self, u: Union[np.ndarray, torch.Tensor, ArrayImpl]) -> Union[np.ndarray, torch.Tensor, ArrayImpl]:
+
+        if self.library == "torch":
+            u = u.to(self.dtype)
+        else:
+            u = u.astype(self.dtype)
 
         return self.growth_rate * u * (1 - u / self.carrying_capacity)
     
@@ -126,5 +142,10 @@ class SourceSink(FieldFunction):
         self._cast_library()
 
     def __call__(self, u: Union[np.ndarray, torch.Tensor, ArrayImpl]) -> Union[np.ndarray, torch.Tensor, ArrayImpl]:
+
+        if self.library == "torch":
+            u = u.to(self.dtype)
+        else:
+            u = u.astype(self.dtype)
 
         return self.source_strength - self.sink_rate * u

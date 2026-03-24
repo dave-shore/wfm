@@ -1,0 +1,1 @@
+"""Memory is in WFM a dual network where information is mapped via a hyperbolic Lorentzian model from the encoder's spherical mesh surface to a Riemannian manifold that retains its state. The decoder then retrieves from the memory to get its boundary conditions."""

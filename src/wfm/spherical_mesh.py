@@ -34,7 +34,7 @@ def cartesian2spherical(x, y, z):
 
 class GenericMesh():
 
-    def __init__(self, radius: float = 1.0, n_radial: int = 100, n_lat: int = 180, n_lon: int = 360, exclude_poles: bool = True, pole_exclusion_angle: float = 0.1, center_exclusion_radius: float = 0.05, library: str = "numpy", dtype = np.complex64, device: Optional[torch.device] = None):
+    def __init__(self, radius: float = 1.0, n_radial: int = 100, n_lon: int = 360, n_lat: int = 180, exclude_poles: bool = True, pole_exclusion_angle: float = 0.1, center_exclusion_radius: float = 0.05, library: str = "numpy", dtype = np.complex64, device: Optional[torch.device] = None):
 
         self.n_radial = n_radial
         self.max_radius = radius
@@ -87,8 +87,8 @@ class SphericalMesh(GenericMesh):
         self,
         radius: float = 1.0,
         n_radial: int = 100,
-        n_lat: int = 180,
         n_lon: int = 360,
+        n_lat: int = 180,
         exclude_poles: bool = True,
         pole_exclusion_angle: float = 0.1,
         center_exclusion_radius: float = 0.05,
@@ -109,7 +109,7 @@ class SphericalMesh(GenericMesh):
             library: Can be "numpy", "torch", or "jax"
             device: PyTorch device for tensor operations
         """
-        super().__init__(radius, n_radial, n_lat, n_lon, exclude_poles, pole_exclusion_angle, center_exclusion_radius, library, dtype, device)
+        super().__init__(radius, n_radial, n_lon, n_lat, exclude_poles, pole_exclusion_angle, center_exclusion_radius, library, dtype, device)
         
         self.boundary_dims_and_idx = [(0,(-1,))]
 
@@ -129,10 +129,10 @@ class SphericalMesh(GenericMesh):
 
         rad_grid, lat_grid, lon_grid = np.meshgrid(radii, lat_angles, lon_angles, indexing='ij')
 
-        rad_flat = rad_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
-        lat_flat = lat_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
-        lon_flat = lon_grid.reshape(self.n_radial, self.n_lat, self.n_lon)
-        points_np = np.stack([rad_flat, lat_flat, lon_flat], axis=-1)
+        rad_flat = rad_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        lon_flat = lon_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        lat_flat = lat_grid.reshape(self.n_radial, self.n_lon, self.n_lat)
+        points_np = np.stack([rad_flat, lon_flat, lat_flat], axis=-1)
 
         indices_np = points_np.copy()
         return points_np, indices_np
@@ -183,7 +183,7 @@ class SphericalMesh(GenericMesh):
         return self._to_backend(self._spherical_coordinates_np(points_np)).reshape(shape)
     
     def get_mesh_shape(self) -> Tuple[int, int]:
-        """Get the shape of the mesh (n_lat, n_lon)."""
+        """Get the shape of the mesh (n_radial,n_lon, n_lat)."""
         return (self.n_radial, self.n_lon, self.n_lat)
     
     def is_valid_point(self, points, coord_system: str = 'spherical'):

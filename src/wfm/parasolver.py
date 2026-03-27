@@ -129,9 +129,8 @@ class RandNetTorch(nn.Module):
                 in_channels = field_out_size,
                 out_channels = field_out_size,
                 kernel_size = self.kernel_size,
-                padding = paddings,
+                padding = tuple(sum(pads) for pads in paddings),
                 stride = self.kernel_size,
-                bias = False,
                 device = device
             ),
             nn.Dropout(0.1),
@@ -172,12 +171,14 @@ class RandNetTorch(nn.Module):
         # shape = (k, L, 3, 100, 360, 180)
 
         U_D = U.flatten(start_dim = 0, end_dim = 1)
+        U_D = torch.where(torch.isnan(U_D), torch.zeros_like(U_D), U_D)
+        U_D = torch.where(torch.isinf(U_D), torch.sign(U_D) * torch.full_like(U_D, fill_value = self.max_U_norm), U_D)
 
         assert U.shape[-4:] == self.input_size[-4:], f"Input tensor must have shape (*,{self.input_size}), except for dims 0-1, but got {U.shape}"
 
         U_reduced = self.simplify_3d_space(U_D)
         U_flat = torch.flatten(U_reduced, start_dim = 2)
-        U_hat = self.net(U_flat @ self.A + self.Z)
+        U_hat = self.net(U_flat @ self.A + self.Z.T)
         U_tilde = self.residual(U_flat)
 
         Y = torch.nn.functional.glu(torch.cat([U_hat, U_tilde], dim = -1)) 
@@ -366,7 +367,7 @@ class SphericalCrankNicolson(BaseIntegrator):
         
         gc.collect()
 
-        for n in trange(time_steps):
+        for n in trange(time_steps, desc = "Spherical Crank-Nicolson integration"):
             V = get_jacobian_on_field(velocity_term, U_curr)
             D = get_jacobian_on_field(diffusion_term, U_curr)
             A = get_jacobian_on_field(advection_term, U_curr)
@@ -456,10 +457,10 @@ class SphericalCrankNicolson(BaseIntegrator):
             output = torch.cat([padded_bc0, output, padded_bc1], dim = i+1)
 
         output = torch.nn.functional.interpolate(
-            output.transpose(-1,1), 
-            size = self.mesh.shape[-1::-1], 
+            output.permute(0,4,1,2,3), 
+            size = self.mesh.shape, 
             mode = "trilinear"
-        ).transpose(-1,1)
+        ).permute(0,2,3,4,1)
 
         if self.mesh.library == "torch":
             return output
@@ -721,7 +722,7 @@ class SphericalRungeKutta8(BaseIntegrator):
 
         dt = self.dt
 
-        for n in trange(time_steps):
+        for n in trange(time_steps, desc = "Spherical Runge-Kutta 8 integration"):
             stages = []
 
             for i in range(self.n_stages):
@@ -760,10 +761,10 @@ class SphericalRungeKutta8(BaseIntegrator):
             output = torch.cat([padded_bc0, output, padded_bc1], dim=i+1)
 
         output = torch.nn.functional.interpolate(
-            output.transpose(-1,1), 
-            size=self.mesh.shape[-1::-1], 
+            output.permute(0,4,1,2,3), 
+            size=self.mesh.shape, 
             mode="trilinear"
-        ).transpose(-1,1)
+        ).permute(0,2,3,4,1)
 
         if self.mesh.library == "torch":
             return output
@@ -1027,7 +1028,7 @@ class SphericalSpectralElement(BaseIntegrator):
         gc.collect()
 
         # SEM time integration loop (using Crank-Nicolson)
-        for n in trange(time_steps):
+        for n in trange(time_steps, desc = "Spherical Spectral Element integration"):
             V = get_jacobian_on_field(velocity_term, U_curr)
             D = get_jacobian_on_field(diffusion_term, U_curr)
             A = get_jacobian_on_field(advection_term, U_curr)
@@ -1132,10 +1133,10 @@ class SphericalSpectralElement(BaseIntegrator):
             output = torch.cat([padded_bc0, output, padded_bc1], dim=i+1)
 
         output = torch.nn.functional.interpolate(
-            output.transpose(-1,1), 
-            size=self.mesh.shape[-1::-1], 
+            output.permute(0,4,1,2,3), 
+            size=self.mesh.shape, 
             mode="trilinear"
-        ).transpose(-1,1)
+        ).permute(0,2,3,4,1)
 
         if self.mesh.library == "torch":
             return output
@@ -1147,7 +1148,7 @@ class SphericalSpectralElement(BaseIntegrator):
 
 class Parareal(BaseIntegrator):
 
-    def __init__(self, coarse_integrator: Callable, fine_integrator: Callable, delta_estimator: Callable, dt: float, mesh: GenericMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1):
+    def __init__(self, coarse_integrator: Callable, fine_integrator: Callable, delta_estimator: Callable, dt: float, mesh: GenericMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, max_U_norm: float = 1.0):
         """
         Initialize Parareal algorithm.
         
@@ -1169,10 +1170,11 @@ class Parareal(BaseIntegrator):
             self.fine_integrator = fine_integrator(dt, mesh, mesh_sampling_rate)
 
         self.delta_estimator = delta_estimator
+        self.max_U_norm = max_U_norm
 
     def train_delta_estimator(self, U_initial: torch.Tensor | jnp.ndarray | np.ndarray, time_steps: int, velocity_term: float | torch.Tensor | jnp.ndarray | np.ndarray, diffusion_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable, advection_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable, reaction_term: float |torch.Tensor | jnp.ndarray | np.ndarray | Callable, dirichlet_bc: List[float | torch.Tensor | jnp.ndarray | np.ndarray] | Callable, fine_integrator: Callable = None, n_epochs: int = 100, optimizer_name: str = "AdamW", optimizer_kwargs: Dict[str, Any] = {"lr": 1e-3, "weight_decay": 1e-4}, patience: int = 10, tol: float = 1e-6):
         """
-        Train the delta estimator.
+        Train the delta estimator. The delta estimator receives the coarse solution and estimates the delta between the coarse and fine solutions.
         
         Args:
             U_initial: Initial condition
@@ -1188,8 +1190,16 @@ class Parareal(BaseIntegrator):
             optimizer_kwargs: Keyword arguments for the optimizer
         """
 
+        patience = min(patience, n_epochs//2 + 1)
+
         coarse_output = self.coarse_integrator(U_initial, time_steps, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc)
+        coarse_output = torch.where(torch.isnan(coarse_output), torch.zeros_like(coarse_output), coarse_output)
+        coarse_output = torch.where(torch.isinf(coarse_output), torch.sign(coarse_output) * torch.full_like(coarse_output, fill_value = self.max_U_norm), coarse_output)
+
         fine_output = self.fine_integrator(U_initial, time_steps, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc) if fine_integrator is None else fine_integrator(U_initial, time_steps, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc)
+        fine_output = torch.where(torch.isnan(fine_output), torch.zeros_like(fine_output), fine_output)
+        fine_output = torch.where(torch.isinf(fine_output), torch.sign(fine_output) * torch.full_like(fine_output, fill_value = self.max_U_norm), fine_output)
+
         delta_gt = fine_output - coarse_output
 
         optimizer = getattr(torch.optim, optimizer_name)(self.delta_estimator.parameters(), **optimizer_kwargs)
@@ -1199,10 +1209,10 @@ class Parareal(BaseIntegrator):
 
         self.delta_estimator.train()
         for epoch in trange(n_epochs, desc = "Training delta estimator"):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none = True)
             output_delta = self.delta_estimator(previous_output + noise)
             fine_output = coarse_output + output_delta
-            loss = torch.norm(fine_output - previous_output, p = 2, dim = -1).max()
+            loss = torch.norm(fine_output - previous_output, p = 2, dim = -1).pow(2).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.delta_estimator.parameters(), max_norm = 1.0)
             optimizer.step()
@@ -1212,9 +1222,11 @@ class Parareal(BaseIntegrator):
             if len(latest_losses) > patience:
                 latest_losses.pop(0)
                 if all(l < tol for l in latest_losses):
-                    noise = torch.randn_like(output_delta) * output_delta.std()
+                    noise = torch.randn_like(output_delta) * output_delta.std() / torch.sqrt(torch.tensor(time_steps))
                 else:
                     noise = torch.zeros_like(output_delta)
+
+            gc.collect()
 
         self.delta_estimator.eval()
         return output_delta

@@ -1,4 +1,5 @@
 from .base import *
+from .functional import ConvReduction
 import torch
 from typing import Tuple
 import torch.nn as nn
@@ -43,7 +44,7 @@ class SensoryFocusMatrixTorch(nn.Module):
 
 class SurfaceMappingTorch(nn.Module):
 
-    def __init__(self, target_shape: Tuple[int, int, int], fourier_dim: int, dropout: float = 0.1, device: torch.device = torch.device("cpu")):
+    def __init__(self, target_shape: Tuple[int, int, int], fourier_dim: int, dropout: float = 0.1, rnn_type: str = "GRU", device: torch.device = torch.device("cpu")):
         """
         Learning the surface mapping: from sequence Lx12x12x3 to Sequence of D-dimensional Fourier mappings from R^2 to R^3, with total size Lx3xDx2 (D < 144 / 2 = 72)
         """
@@ -59,14 +60,14 @@ class SurfaceMappingTorch(nn.Module):
         self.dropout = dropout
 
         # 3 learnable mappings (one for each field dimension) between input sequence and Fourier mappings
-        self.conv = nn.Conv3d(self.target_channels, 1, kernel_size = (self.target_height // 3, self.target_width // 3, 1), stride = (self.target_height // 3, self.target_width // 3, 1), device = self.device)
+        self.conv = ConvReduction(kernel_size = (self.target_height // 3, self.target_width // 3), stride = (self.target_height // 3, self.target_width // 3), channels = self.target_channels, ndim = 2)
         D_out = np.floor((self.target_height + 2*self.conv.padding[0] - self.conv.kernel_size[0]) / self.conv.stride[0] + 1)
         H_out = np.floor((self.target_width + 2*self.conv.padding[1] - self.conv.kernel_size[1]) / self.conv.stride[1] + 1)
         self.conv_output_size = int(D_out * H_out)
         self.hidden_size = int(self.conv_output_size // 2 + self.fourier_dim * 3) # Avg between conv output and Fourier mappings
         self.metamappings = nn.Sequential(
             nn.Flatten(start_dim = 2),
-            nn.LSTM(self.conv_output_size, self.hidden_size, batch_first = True, device = self.device, dropout = dropout)
+            getattr(nn, rnn_type)(self.conv_output_size, self.hidden_size, batch_first = True, device = self.device, dropout = dropout)
         )
 
         self.feature_mapping = nn.Sequential(
@@ -94,11 +95,11 @@ class SurfaceMappingTorch(nn.Module):
         """
         Process input sequence to Fourier mappings.
         """
-        if X.dim() < 5:
+        while X.dim() < 5:
             X = X.unsqueeze(0)
         # X.shape = (batch_size, sequence_length, height, width, channels)
 
-        X_conv = self.conv(X.transpose(1,-1)).transpose(1,-1)
+        X_conv = self.conv(X)
 
         rnn_mappings, _ = self.metamappings(X_conv)
         fourier_mappings = self.feature_mapping(rnn_mappings).reshape(X.shape[0], X.shape[1], 3, self.fourier_dim, 2)

@@ -1,9 +1,11 @@
-from typing import Union, List, Any
+from typing import Union, List, Tuple
 import torch
 import numpy as np
 from jaxlib.xla_extension import ArrayImpl
 import jax.numpy as jnp
 from .base import ALLOWED_LIBRARIES
+import torch.nn as nn
+from math import floor
 
 
 class ParamsProxy:
@@ -29,6 +31,72 @@ class ParamsProxy:
     def __repr__(self):
         return f"ParamsProxy({[getattr(self._obj, attr_name) for attr_name in self._attr_names]})"
 
+
+class ConvReduction(nn.Module):
+
+    def __init__(self, kernel_size: int | Tuple[int, ...] = 3, stride: int | Tuple[int, ...] = 1, padding: int | Tuple[int, ...] = 1, channels: int = 3, ndim: int = 3):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, ) * ndim
+        self.stride = stride if isinstance(stride, tuple) else (stride, ) * ndim
+        self.padding = padding if isinstance(padding, tuple) else (padding, ) * ndim
+        self.channels = channels
+        self.ndim = ndim
+
+        if ndim == 3:
+            self.conv = nn.Conv3d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+            self.reverse_conv = nn.ConvTranspose3d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+        elif ndim == 2:
+            self.conv = nn.Conv2d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+            self.reverse_conv = nn.ConvTranspose2d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+        elif ndim == 1:
+            self.conv = nn.Conv1d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+            self.reverse_conv = nn.ConvTranspose1d(channels, channels, kernel_size = kernel_size, stride = stride, padding = padding)
+        else:
+            raise ValueError(f"Invalid number of dimensions: {ndim}. Must be 1, 2 or 3.")
+
+        self.reverse_conv.weight = torch.nn.Parameter(torch.linalg.pinv(self.conv.weight.data))
+        self.reverse_conv.bias = torch.nn.Parameter(- self.conv.bias.data)
+
+    
+    def inverse_operation(self, x: torch.Tensor, input_preconv_shape: Tuple[int, ...]):
+
+        channel_dim_index = max(i for i, s in enumerate(input_preconv_shape) if s == self.channels) if self.channels in input_preconv_shape else None
+        original_shape = x.shape
+        # x.shape = (batch_size, seq_len, hidden_size)
+
+        x = x.flatten(end_dim = -2)
+
+        input_post_conv_shape = (
+            -1, 
+            self.channels, 
+            *[floor(1 + (s + 2*self.padding - self.kernel_size) / self.stride) for s in input_preconv_shape[-self.ndim:]]
+        )
+
+        output = self.reverse_conv(x.reshape(input_post_conv_shape))
+        output = output.reshape(*original_shape[:-1], *output.shape[-self.ndim-1:])
+        if channel_dim_index is not None:
+            output = output.transpose(1, channel_dim_index)
+
+        return output
+
+
+    def forward(self, x: torch.Tensor):
+
+        original_shape = x.shape
+
+        if x.ndim > self.ndim + 2:
+            x = x.flatten(end_dim = - self.ndim - 2)
+
+        channel_dim_index = max(i for i, s in enumerate(x.shape) if s == self.channels)
+        x = x.transpose(1, channel_dim_index)
+
+        output = self.conv(x).flatten(start_dim = 1)
+
+        output = output.reshape(*original_shape[:-self.ndim - 2], -1)
+        if channel_dim_index is not None:
+            output = output.transpose(1, channel_dim_index)
+
+        return output
 
 class FieldFunction():
 

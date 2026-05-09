@@ -25,7 +25,9 @@ dependencies = [
     "pykeops (>=2.3,<3.0)",
     "ipywidgets (>=8.1.7,<9.0.0)",
     "jupyter (>=1.1.1,<2.0.0)",
-    "ftfy (>=6.3.1,<7.0.0)"
+    "ftfy (>=6.3.1,<7.0.0)",
+    "tensorly (>=0.9.0,<0.10.0)",
+    "tensorly-torch (>=0.5.0,<0.6.0)"
 ]
 
 [tool.poetry]

@@ -63,7 +63,7 @@ class SurfaceMappingTorch(nn.Module):
         self.conv = ConvReduction(kernel_size = (self.target_height // 3, self.target_width // 3), stride = (self.target_height // 3, self.target_width // 3), channels = self.target_channels, ndim = 2)
         D_out = np.floor((self.target_height + 2*self.conv.padding[0] - self.conv.kernel_size[0]) / self.conv.stride[0] + 1)
         H_out = np.floor((self.target_width + 2*self.conv.padding[1] - self.conv.kernel_size[1]) / self.conv.stride[1] + 1)
-        self.conv_output_size = int(D_out * H_out)
+        self.conv_output_size = int(D_out * H_out * self.target_channels)
         self.hidden_size = int(self.conv_output_size // 2 + self.fourier_dim * 3) # Avg between conv output and Fourier mappings
         self.metamappings = nn.Sequential(
             nn.Flatten(start_dim = 2),

@@ -54,22 +54,26 @@ class ConvReduction(nn.Module):
         else:
             raise ValueError(f"Invalid number of dimensions: {ndim}. Must be 1, 2 or 3.")
 
+        self.conv = self.conv.to(torch.float32)
+        self.reverse_conv = self.reverse_conv.to(torch.float32)
         self.reverse_conv.weight = torch.nn.Parameter(torch.linalg.pinv(self.conv.weight.data))
         self.reverse_conv.bias = torch.nn.Parameter(- self.conv.bias.data)
 
     
     def inverse_operation(self, x: torch.Tensor, input_preconv_shape: Tuple[int, ...]):
 
+        dtype = x.dtype
+        x = x.to(torch.float32)
         channel_dim_index = max(i for i, s in enumerate(input_preconv_shape) if s == self.channels) if self.channels in input_preconv_shape else None
         original_shape = x.shape
         # x.shape = (batch_size, seq_len, hidden_size)
 
-        x = x.flatten(end_dim = -2)
+        x = torch.flatten(x, end_dim = -2)
 
         input_post_conv_shape = (
             -1, 
             self.channels, 
-            *[floor(1 + (s + 2*self.padding - self.kernel_size) / self.stride) for s in input_preconv_shape[-self.ndim:]]
+            *[floor(1 + (s + 2*self.padding[i] - self.kernel_size[i]) / self.stride[i]) for i,s in enumerate(input_preconv_shape[-self.ndim:])]
         )
 
         output = self.reverse_conv(x.reshape(input_post_conv_shape))
@@ -77,26 +81,26 @@ class ConvReduction(nn.Module):
         if channel_dim_index is not None:
             output = output.transpose(1, channel_dim_index)
 
-        return output
+        return output.to(dtype)
 
 
     def forward(self, x: torch.Tensor):
 
+        dtype = x.dtype
+        x = x.to(torch.float32)
         original_shape = x.shape
 
         if x.ndim > self.ndim + 2:
-            x = x.flatten(end_dim = - self.ndim - 2)
+            x = x.flatten(end_dim = - self.ndim - 2) # -2 because end_dim includes the last dimension
 
         channel_dim_index = max(i for i, s in enumerate(x.shape) if s == self.channels)
         x = x.transpose(1, channel_dim_index)
 
         output = self.conv(x).flatten(start_dim = 1)
 
-        output = output.reshape(*original_shape[:-self.ndim - 2], -1)
-        if channel_dim_index is not None:
-            output = output.transpose(1, channel_dim_index)
+        output = output.reshape(*original_shape[:-self.ndim - 1], -1)
 
-        return output
+        return output.to(dtype)
 
 class FieldFunction():
 

@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from tqdm import trange
 import os
 import gc
+from math import floor, sqrt
 from typing import Tuple, Dict, Any, Optional, Callable, List, Union, Iterable
 from .spherical_mesh import *
 from .base import *
@@ -193,12 +194,13 @@ class RandNetTorch(nn.Module):
     Shallow random neural network used to estimate the delta between a coarse integrator (e.g. Runge-Kutta 1) and the actual solution of a differential equation.
     """
 
-    def __init__(self, field_out_size: int, mesh_size: Tuple[int, int, int], kernel_size: int = 8, device: torch.device = torch.device("cpu"), max_U_norm: float = 1.0, regularization_lambda: float = 0.01, optimizer_kwargs: Dict[str, Any] = {"lr": 1e-2}, max_dataset_size: int = 1000, use_explicit_ridge: bool = False):
+    def __init__(self, field_out_size: int, mesh_size: Tuple[int, int, int], kernel_size: int = 196, device: torch.device = torch.device("cpu"), max_U_norm: float = 1.0, regularization_lambda: float = 0.01, optimizer_kwargs: Dict[str, Any] = {"lr": 1e-2}, max_dataset_size: int = 1000, use_explicit_ridge: bool = False):
 
         super().__init__()
 
         self.field_out_size = field_out_size
         self.kernel_size = kernel_size 
+        self.stride = floor(sqrt(kernel_size))
         self.mesh_size = mesh_size
         self.device = device
         self.max_U_norm = max_U_norm
@@ -213,10 +215,10 @@ class RandNetTorch(nn.Module):
         # shape = (k*L, 3, 100, 360, 180)
 
         # Need to simplify the 3D space to a 2D space, by convolving with a kernel
-        self.simplify_3d_space = ConvReduction(kernel_size = kernel_size, stride = 1, padding = 0, channels = field_out_size, ndim = 3)
-        self.backconv_3d_space = self.simplify_3d_space.inverse_op
+        self.simplify_3d_space = ConvReduction(kernel_size = self.kernel_size, stride = self.stride, padding = 0, channels = field_out_size, ndim = 3)
+        self.backconv_3d_space = self.simplify_3d_space.inverse_operation
 
-        self.conv_output_size = [self.input_size[0], self.input_size[1]] + [min(self.kernel_size, s) for s in self.input_size[2:]]
+        self.conv_output_size = [self.input_size[0], self.input_size[1], self.simplify_3d_space.channels] + [floor(1 + (s + 2*self.simplify_3d_space.padding[i] - self.simplify_3d_space.kernel_size[i]) / self.simplify_3d_space.stride[i]) for i,s in enumerate(self.mesh_size)]
         self.input_size_flat = int(np.prod(self.conv_output_size[2:]))
         # output here should have shape (batch_size, L, 3, 8, 8, 8)
 
@@ -251,8 +253,9 @@ class RandNetTorch(nn.Module):
 
         assert U.shape[-4:] == self.input_size[-4:], f"Input tensor must have shape (*,{self.input_size}), except for dims 0-1, but got {U.shape}"
 
-        U_flat, ranks, factors = self.simplify_3d_space(U_D)
-        U_random = self.random_layer(U_flat).flatten(end_dim = 1)
+        original_shape = U_D.shape
+        U_flat = self.simplify_3d_space(U_D)
+        U_random = self.random_layer(U_flat)
         # U_random.shape = (batch_size*L, 3*8*8*8)
 
         # Train Ridge Regression model on the dataset collected so far, if any
@@ -262,8 +265,9 @@ class RandNetTorch(nn.Module):
             self.output_layer.fit(torch.randn_like(U_random).detach(), torch.zeros_like(U_random).detach())
 
         U_reg = self.output_layer.predict(U_random.detach()).reshape(U_flat.shape)
+        U_reg = torch.as_tensor(U_reg, dtype = U_random.dtype)
 
-        U_output = self.backconv_3d_space(U_reg, ranks, factors)
+        U_output = self.backconv_3d_space(U_reg, original_shape)
         if U_output.dim() < U.dim():
             U_output = U_output.unsqueeze(0)
         shape_differences = [U.shape[i] - U_output.shape[i] for i in range(len(U_output.shape))][::-1]
@@ -275,85 +279,6 @@ class RandNetTorch(nn.Module):
         self._check_dataset_size()
 
         return U_output
-
-
-
-class RadialBasisFunctionTorch(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return torch.exp(-x**2)
-
-
-class ELM_base(nn.Module):
-    """
-    From https://github.com/Parallel-in-Time-Differential-Equations/RandNet-Parareal/blob/main/models.py
-    """
-    
-    def __init__(self, d, seed=47, res_size=500, loss='relu', M=1, R=1, alpha=0.1, degree=1, m=5):
-
-        from sklearn.preprocessing import PolynomialFeatures
-
-        self.d = d
-        self.N = res_size
-        self.rng = np.random.default_rng(seed)
-        self.m = m
-        
-        radbas = RadialBasisFunctionTorch()
-        relu = nn.ReLU()
-        tanh = nn.Tanh()
-        self.loss = lambda x: torch.stack([radbas(x), relu(x), tanh(x)]).mean(dim = 0)
-        self.M = M
-        self.R = R
-        self.alpha = alpha
-        self.mdl = Ridge(alpha=self.alpha)
-        self.poly = PolynomialFeatures(degree=degree)
-        self.poly.fit(torch.zeros((1, d)))
-        self.degree = self.poly.n_output_features_
-        
-        bias, C = self._init_obj()
-        self.bias, self.C = bias, C
-
-        
-    def _init_obj(self):
-        N, rng = self.N, self.rng
-        bias = torch.as_tensor(rng.uniform(-1, 1, (N, 1)))
-        C = torch.as_tensor(rng.uniform(-1, 1, (N, self.degree)))
-        return bias, C
-    
-    def _fit(self, x, y, bias, C):
-
-        x = self.poly.fit_transform(x)
-        X = self.loss(bias + C @ x.T) # activation
-        X = X.T #first col is intercept
-        self.mdl.fit(X, y)
-
-    def fit(self, x, y, k):
-        self.x = x
-        self.y = y
-        self.k = k
-        
-    def predict(self, new_x):
-        bias = self.M * self.R * self.bias
-        bias = self.bias
-        C = self.R * self.C
-
-        s_idx = torch.argsort(scipy.spatial.distance.cdist(new_x, self.x, metric='sqeuclidean')[0,:])
-        xm = self.x[s_idx[:self.m], :]
-        ym = self.y[s_idx[:self.m], :]
-        
-        new_X = self.poly.fit_transform(new_x)
-        _int = bias + C @ new_X.T
-        new_X = self.loss(_int)
-        self._fit(xm, ym, bias, C)
-        return torch.squeeze(self.mdl.predict(new_X.T))
-        
-    def forward(self, x, y, new_x, k):
-        self.fit(x, y, k)
-        return self.predict(new_x)
-    
 
 
 class BaseIntegrator():
@@ -693,6 +618,7 @@ class SphericalCrankNicolson(BaseIntegrator):
         advection_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         reaction_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         dirichlet_bc: List[float | torch.Tensor | jnp.ndarray | np.ndarray] | Callable,
+        show_progress_bar: bool = True,
     ):
         """Integrate a single (unbatched) sample.
 
@@ -744,7 +670,7 @@ class SphericalCrankNicolson(BaseIntegrator):
         else:
             eye = np.eye(field_dim, dtype=U_curr.dtype).reshape(1, 1, 1, field_dim, field_dim)
 
-        for n in trange(time_steps, desc = "Spherical Crank-Nicolson integration"):
+        for n in trange(time_steps, desc = "Spherical Crank-Nicolson integration", disable = not show_progress_bar):
             V = get_jacobian_on_field(velocity_term, U_curr)
             D = get_jacobian_on_field(diffusion_term, U_curr)
             A = get_jacobian_on_field(advection_term, U_curr)
@@ -989,6 +915,7 @@ class SphericalRungeKutta8(BaseIntegrator):
         advection_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         reaction_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         dirichlet_bc: List[float | torch.Tensor | jnp.ndarray | np.ndarray] | Callable,
+        show_progress_bar: bool = True,
     ):
         """Integrate a single (unbatched) sample with RKF45.
 
@@ -1054,7 +981,7 @@ class SphericalRungeKutta8(BaseIntegrator):
 
         dt = self.dt
 
-        for n in trange(time_steps, desc = "Spherical Runge-Kutta integration"):
+        for n in trange(time_steps, desc = "Spherical Runge-Kutta integration", disable = not show_progress_bar):
             stages = []
 
             for i in range(self.n_stages):
@@ -1388,6 +1315,7 @@ class SphericalSpectralElement(BaseIntegrator):
         advection_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         reaction_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable,
         dirichlet_bc: List[float | torch.Tensor | jnp.ndarray | np.ndarray] | Callable,
+        show_progress_bar: bool = True,
     ):
         """Solve PDE using Spectral Element spatial discretisation with
         Crank-Nicolson time integration on a single (unbatched) sample.
@@ -1440,7 +1368,7 @@ class SphericalSpectralElement(BaseIntegrator):
         else:
             eye = np.eye(field_dim, dtype=U_curr.dtype).reshape(1, 1, 1, field_dim, field_dim)
 
-        for n in trange(time_steps, desc = "Spherical Spectral Element integration"):
+        for n in trange(time_steps, desc = "Spherical Spectral Element integration", disable = not show_progress_bar):
             V = get_jacobian_on_field(velocity_term, U_curr)
             D_coeff = get_jacobian_on_field(diffusion_term, U_curr)
             A_coeff = get_jacobian_on_field(advection_term, U_curr)
@@ -1607,21 +1535,23 @@ class Parareal(BaseIntegrator):
             
             fine_output = coarse_output + output_delta
             fine_output_single_steps = fine_output.flatten(end_dim = 1).unsqueeze(1)
-            refined_output = self.coarse_integrator(fine_output_single_steps, 1, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc)
+            refined_output = self.coarse_integrator(fine_output_single_steps, 1, velocity_term, diffusion_term, advection_term, reaction_term, dirichlet_bc, show_progress_bar = False)
             refined_output = refined_output.unflatten(0, (-1, time_steps+1))
 
             # Track convergence (compare against previous iteration's
             # solution, dropping the final time step so the shapes match
             # ``previous_output``)
-            if isinstance(fine_output, torch.Tensor):
-                error = torch.norm(fine_output[:, :-1] - previous_output, p=2).item()
-            elif isinstance(fine_output, jnp.ndarray):
-                error = float(jnp.linalg.norm(fine_output[:, :-1] - previous_output))
+            if isinstance(refined_output, torch.Tensor):
+                error = torch.norm(refined_output[:, :-1] - previous_output, p=2).item()
+            elif isinstance(refined_output, jnp.ndarray):
+                error = float(jnp.linalg.norm(refined_output[:, :-1] - previous_output))
             else:
-                error = float(np.linalg.norm(fine_output[:, :-1] - previous_output))
+                error = float(np.linalg.norm(refined_output[:, :-1] - previous_output))
 
-            previous_output = fine_output[:, :-1]
+            previous_output = refined_output[:, :-1]
+            if k == 0:
+                del coarse_output
+                gc.collect()
             k += 1
 
-        fine_output = self._denormalize_field(fine_output, _n_dims_added)
-        return fine_output
+        return self._denormalize_field(refined_output, _n_dims_added)

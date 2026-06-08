@@ -298,10 +298,11 @@ class BaseIntegrator():
 
     SPATIAL_DIM_NAMES = ("radial", "longitude", "latitude")
 
-    def __init__(self, dt: float, mesh: GenericMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1):
+    def __init__(self, dt: float, mesh: GenericMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, dtype: Optional[torch.dtype] = None):
 
         self.dt = dt
         self.mesh = mesh
+        self.dtype = dtype if dtype is not None else torch.get_default_dtype() if mesh.library == "torch" else np.float32
 
         self.spatial_ndim = len(self.mesh.shape)
         self.canonical_ndim = 2 + self.spatial_ndim + 1
@@ -312,6 +313,7 @@ class BaseIntegrator():
         x = self.mesh.points[::self.mesh_sampling_rate[0], ::self.mesh_sampling_rate[1], ::self.mesh_sampling_rate[2], :]
 
         if mesh.library == "torch":
+            torch.set_default_dtype(self.dtype)
             local_dx_components = []
             for i in range(x.shape[-1]):
                 xi = x[..., i]
@@ -358,8 +360,6 @@ class BaseIntegrator():
             self.concat = np.concatenate
             self.solve = np.linalg.lstsq
             self.full = np.full
-
-        self.dtype = torch.get_default_dtype() if mesh.library == "torch" else np.float32
 
         self._canonical_local_dx = self._prepend_unit_dims(self.local_dx, 2)
         self._canonical_mesh_points = self._prepend_unit_dims(x, 2)
@@ -604,9 +604,9 @@ class SphericalCrankNicolson(BaseIntegrator):
     differences in space.
     """
 
-    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1):
+    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, dtype: Optional[torch.dtype] = None):
 
-        super().__init__(dt, mesh, mesh_sampling_rate)
+        super().__init__(dt, mesh, mesh_sampling_rate, dtype)
 
     @torch.no_grad()
     def _integrate_single(
@@ -771,9 +771,9 @@ class SphericalRungeKutta8(BaseIntegrator):
     Uses the 5th-order accurate RKF45 Butcher tableau (6 stages).
     """
 
-    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, dtype = None):
+    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, dtype: Optional[torch.dtype] = None):
 
-        super().__init__(dt, mesh, mesh_sampling_rate)
+        super().__init__(dt, mesh, mesh_sampling_rate, dtype)
 
         # RKF45 Butcher tableau — 6 stages, 5th-order solution
         self.a = [
@@ -1039,8 +1039,8 @@ class SphericalSpectralElement(BaseIntegrator):
     and time integration uses an implicit Crank-Nicolson scheme.
     """
 
-    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, polynomial_order: int = 4):
-        super().__init__(dt, mesh, mesh_sampling_rate)
+    def __init__(self, dt: float, mesh: SphericalMesh, mesh_sampling_rate: int | Tuple[int, int, int] = 1, polynomial_order: int = 4, dtype: Optional[torch.dtype] = None):
+        super().__init__(dt, mesh, mesh_sampling_rate, dtype)
         self.polynomial_order = polynomial_order
         self._setup_spectral_basis()
 
@@ -1452,7 +1452,7 @@ class SphericalSpectralElement(BaseIntegrator):
 
 class Parareal(BaseIntegrator):
 
-    def __init__(self, coarse_integrator: Callable, fine_integrator: Callable | None = None, delta_estimator: Callable | None = None, dt: float = 0.1, mesh: GenericMesh | None = None, mesh_sampling_rate: int | Tuple[int, int, int] = 1, max_U_norm: float = 1.0):
+    def __init__(self, coarse_integrator: Callable, fine_integrator: Callable | None = None, delta_estimator: Callable | None = None, dt: float = 0.1, mesh: GenericMesh | None = None, mesh_sampling_rate: int | Tuple[int, int, int] = 1, max_U_norm: float = 1.0, dtype: Optional[torch.dtype] = None):
         """
         Initialize Parareal algorithm.
         
@@ -1465,19 +1465,23 @@ class Parareal(BaseIntegrator):
             mesh_sampling_rate: Mesh sampling rate
             max_U_norm: Maximum norm of the field
         """
-        super().__init__(dt, mesh, mesh_sampling_rate)
+        super().__init__(dt, mesh, mesh_sampling_rate, dtype)
 
         if isinstance(coarse_integrator, BaseIntegrator):
             self.coarse_integrator = coarse_integrator
         else:
-            self.coarse_integrator = coarse_integrator(dt, mesh, mesh_sampling_rate)
+            self.coarse_integrator = coarse_integrator(dt, mesh, mesh_sampling_rate, dtype =dtype)
 
         if isinstance(fine_integrator, BaseIntegrator):
             self.fine_integrator = fine_integrator
         else:
-            self.fine_integrator = fine_integrator(dt, mesh, mesh_sampling_rate)
+            self.fine_integrator = fine_integrator(dt, mesh, mesh_sampling_rate, dtype =dtype)
 
-        self.delta_estimator = delta_estimator
+        if isinstance(delta_estimator, nn.Module):
+            self.delta_estimator = delta_estimator.to(dtype=self.dtype)
+        else:
+            self.delta_estimator = delta_estimator
+
         self.max_U_norm = max_U_norm
 
     def _check_integration(self, U: torch.Tensor | jnp.ndarray | np.ndarray, time_steps: int, velocity_term: float | torch.Tensor | jnp.ndarray | np.ndarray, diffusion_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable, advection_term: float | torch.Tensor | jnp.ndarray | np.ndarray | Callable, reaction_term: float |torch.Tensor | jnp.ndarray | np.ndarray | Callable, dirichlet_bc: List[float | torch.Tensor | jnp.ndarray | np.ndarray] | Callable):

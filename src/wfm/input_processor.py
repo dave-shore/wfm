@@ -522,18 +522,20 @@ class BinaryTokenizer:
         
         return np.asarray(binary_codes)
     
-    def decode(self, binary_codes: List[List[int | np.ndarray]], print_special_tokens: bool = False, return_list: bool = False) -> str | List[str]:
+    def decode(self, binary_codes: List[List[int | np.ndarray | torch.Tensor]], print_special_tokens: bool = False, return_list: bool = False) -> str | List[str]:
         """Decode binary integer codes back to text."""
         decoded_texts = [""] * len(binary_codes)
         powers_of_two = 2**np.arange(self.binary_dim*3, dtype = np.int64)[::-1]
-        
+
         if isinstance(binary_codes[0][0], torch.Tensor):
-            powers_of_two = torch.from_numpy(powers_of_two)
+            powers_of_two = torch.from_numpy(powers_of_two).to(dtype = torch.int64)
 
         for i, encoding in enumerate(binary_codes):
             for code in encoding:
                 if isinstance(code, int):
                     token_id = code
+                elif isinstance(code, torch.Tensor):
+                    token_id = code.to(dtype = torch.int64).reshape(-1).dot(powers_of_two).item()
                 else:
                     token_id = code.reshape(-1).dot(powers_of_two)
 

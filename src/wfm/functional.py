@@ -125,6 +125,17 @@ class FieldFunction():
     def __call__(self, *args, **kwargs):
         pass
 
+    def to(self, dtype: torch.dtype):
+        self.dtype = dtype
+        if self.library == "torch":
+            self.params = [param.to(dtype=dtype) for param in self.params]
+        elif self.library == "jax":
+            self.params = [jnp.astype(param, dtype=dtype) for param in self.params]
+        else:
+            self.params = [np.astype(param, dtype=dtype) for param in self.params]
+
+        return self
+
 
 class FitzhughNagumo(FieldFunction):
 

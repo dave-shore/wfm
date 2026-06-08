@@ -131,8 +131,8 @@ def create_peripheral_array_simple(X):
     temporal_concat = concat_function([prev_X, curr_X, next_X], axis=2)  # (3, 22, 12, 4, 3)
     
     # Step 3: Pad dimension 3 (axis=3) with zeros: 4 → 12
-    result = pad_function(temporal_concat, ((0,0), (0,0), (0,0), (width,width), (0,0)), 
-                   mode='constant')  # (3, 22, 12, 12, 3)
+    padding_conf = ((0,0), (0,0), (0,0), (width,width), (0,0)) if library != "torch" else (0,0,width,width)
+    result = pad_function(temporal_concat, padding_conf)  # (3, 22, 12, 12, 3)
     
     return result
 

@@ -9,7 +9,7 @@ import torch
 from typing import Optional, Union, Dict, Any, List, Tuple, Type, Callable
 import numpy as np
 from .spherical_mesh import GenericMesh, SphericalMesh
-from .functional import FitzhughNagumo
+from .functional import FitzhughNagumo, FieldFunction
 from .base import *
 import torch.nn as nn
 import jax.numpy as jnp
@@ -44,7 +44,8 @@ class PDETorch(nn.Module):
         reaction: Optional[Union[Type, str]] = None,
         reaction_function_kwargs: Dict[str, Union[float, np.ndarray, torch.Tensor]] = None,
         boundary_conditions: Optional[List[Tuple[float, torch.Tensor, jnp.ndarray, np.ndarray]] | Callable] = None,
-        mesh: Optional[SphericalMesh] = None
+        mesh: Optional[SphericalMesh] = None,
+        dtype: Optional[torch.dtype] = None
     ):
         """
         Initialize the differential equation.
@@ -67,7 +68,11 @@ class PDETorch(nn.Module):
         """
         super().__init__()
         
+        self.dtype = dtype if dtype is not None else torch.get_default_dtype()
+        
         self.V = velocity
+        if isinstance(velocity, (torch.Tensor, nn.Module, FieldFunction)):
+            self.V = velocity.to(dtype=self.dtype)
         
         # Handle diffusion - must be a class to instantiate or a scalar/tensor
         if isinstance(diffusion, type):
@@ -77,6 +82,8 @@ class PDETorch(nn.Module):
         else:
             self.D = diffusion  # scalar or tensor
         self.D_kwargs = diffusion_function_kwargs
+        if isinstance(self.D, (torch.Tensor, nn.Module, FieldFunction)):
+            self.D = self.D.to(dtype=self.dtype)
         
         # Handle advection - must be a class to instantiate or a scalar/tensor  
         if isinstance(advection, type):
@@ -86,6 +93,8 @@ class PDETorch(nn.Module):
         else:
             self.A = advection  # scalar or tensor
         self.A_kwargs = advection_function_kwargs
+        if isinstance(self.A, (torch.Tensor, nn.Module, FieldFunction)):
+            self.A = self.A.to(dtype=self.dtype)
         
         # Handle reaction - must be a class to instantiate or a string key
         if isinstance(reaction, type):
@@ -99,6 +108,8 @@ class PDETorch(nn.Module):
         else:
             self.R = reaction
         self.R_kwargs = reaction_function_kwargs
+        if isinstance(self.R, (torch.Tensor, nn.Module, FieldFunction)):
+            self.R = self.R.to(dtype=self.dtype)
 
         self.boundary_conditions = boundary_conditions or []
         self.mesh = mesh

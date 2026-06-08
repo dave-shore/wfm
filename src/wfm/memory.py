@@ -1,5 +1,0 @@
-
-
-class GaussianAttention(nn.Module):
-
-    

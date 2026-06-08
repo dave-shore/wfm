@@ -36,6 +36,22 @@ class GenericMesh():
 
     def __init__(self, radius: float = 1.0, n_radial: int = 100, n_lon: int = 360, n_lat: int = 180, exclude_poles: bool = True, pole_exclusion_angle: float = 0.1, center_exclusion_radius: float = 0.05, library: str = "numpy", dtype = np.complex64, device: Optional[torch.device] = None):
 
+        """
+        Initialize the generic mesh.
+        
+        Args:
+            radius: Radius of the sphere (default: 1.0)
+            n_radial: Number of radial points from center_exclusion_radius to radius (default: 100)
+            n_lon: Number of longitude points from 0 to 2*pi (default: 360)
+            n_lat: Number of latitude points from pole_exclusion_angle to pi - pole_exclusion_angle (default: 180)
+            exclude_poles: Whether to exclude the poles (default: True)
+            pole_exclusion_angle: Latitude angle in radiants to exclude from poles (default: 0.1)
+            center_exclusion_radius: Radius, in percentage of radius, to exclude from center (default: 0.05)
+            library: Library to use for the mesh, accepts "numpy", "torch", or "jax" (default: "numpy")
+            dtype: Data type referred to the field that will be defined on the mesh (default: np.complex64)
+            device: Device to use for the mesh (default: None)
+        """
+
         self.n_radial = n_radial
         self.max_radius = radius
         self.n_lat = n_lat
@@ -47,7 +63,7 @@ class GenericMesh():
         self.center_exclusion_radius = center_exclusion_radius
         self.library = library.lower() if library in ALLOWED_LIBRARIES else "numpy"
         self.c_dtype = dtype
-        self.r_dtype = getattr(np, f"float{np.nbytes[dtype] // 2 * 8}")
+        self.r_dtype = getattr(np, f"float{np.nbytes[dtype] // 2 * 8}") if "complex" in str(dtype) else dtype
         if self.library == "torch":
             self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         elif self.library == "jax":

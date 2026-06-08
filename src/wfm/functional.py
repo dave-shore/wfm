@@ -221,3 +221,97 @@ class SourceSink(FieldFunction):
             u = u.astype(self.dtype)
 
         return self.source_strength - self.sink_rate * u
+
+
+class InfiniteGaussianAttention(nn.Module):
+
+    def __init__(self, input_size: int, intermediate_size: int, dropout: float = 0.1) -> None:
+        super().__init__()
+
+        self.input_size = input_size
+        self.intermediate_size = intermediate_size
+        self.dropout = dropout
+
+        self.bahdanau_attention = nn.Sequential(
+            nn.Linear(self.input_size, self.intermediate_size),
+            nn.Tanh(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.intermediate_size, 1),
+        )
+
+    def _likelihood_estimation_step(self, positions: torch.Tensor, obs_comp_matrix: torch.Tensor, obs_weights: torch.Tensor, attn_mask: torch.Tensor, alpha: float) -> Tuple[float, torch.Tensor, torch.Tensor]:
+
+        # positions.shape = (batch_size, seq_len)
+        # obs_comp_matrix.shape = (batch_size, seq_len, n_components)
+        # obs_weights.shape = (batch_size, seq_len)
+        # attn_mask.shape = (batch_size, seq_len)
+
+        mean_pos_matrix = positions.unsqueeze(-1) * obs_comp_matrix
+        # shape = (batch_size, seq_len, n_components)
+        comp_mean_matrix = (mean_pos_matrix * obs_weights.unsqueeze(-1)).sum(dim = 1, keepdim = True) / obs_weights.sum(dim = 1, keepdim = True)
+        comp_std_matrix = torch.pow(mean_pos_matrix - comp_mean_matrix.unsqueeze(1), 2).sum(dim = 1, keepdim = True) / obs_comp_matrix.sum(dim = 1, keepdim = True)
+        # shape = (batch_size, 1, n_components)
+        count_others = obs_comp_matrix.sum(dim = 1, keepdim = True) - obs_comp_matrix
+        # shapes = (batch_size, seq_len, n_components)
+        current_scores = comp_std_matrix.unsqueeze(1).sqrt() * torch.exp(-1 * comp_std_matrix * (mean_pos_matrix - comp_mean_matrix)**2 / 2) * count_others / (attn_mask.sum(dim = 1, keepdim = True).unsqueeze(-1) - 1 + alpha)
+        # shape = (batch_size, seq_len, n_components)
+        total_likelihood = current_scores.flatten(start_dim = 1).sum(dim = -1).mean()
+
+        return total_likelihood.item(), comp_mean_matrix, comp_std_matrix
+
+    def _components_estimation(self, scores: torch.Tensor, attn_mask: torch.Tensor, alpha: float | None = None, verbose: bool = False, tolerance: float = 1e-6, max_components: int = 50) -> torch.Tensor:
+
+        if alpha is None or alpha <= 0:
+            alpha = torch.distributions.Gamma(1, 1).sample().reciprocal()
+
+        batch_size = scores.shape[0]
+        seq_len = scores.shape[1]
+        attn_mask = attn_mask.reshape(batch_size, seq_len).to(dtype = torch.int8)
+        n_components = 1
+
+        positions = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1) * attn_mask
+        # shape = (batch_size, seq_len)
+        obs_comp_matrix = torch.ones(batch_size, seq_len, n_components)
+        total_likelihood, comp_mean_matrix, comp_std_matrix = self._likelihood_estimation_step(positions, obs_comp_matrix, scores, attn_mask, alpha)
+        if verbose:
+            print(f"Average sample likelihood at iteration {n_components}: {total_likelihood:.6f}")
+
+        concentration_beta = torch.distributions.Gamma(torch.ones(batch_size), torch.ones(batch_size)).sample().reciprocal()
+        rate_inv_theta = 2
+        
+        while True:
+            previous_likelihood = total_likelihood
+            n_components *= 2
+            concentration_k = n_components - 1/2
+            alpha = torch.distributions.Gamma(concentration_k, rate_inv_theta).sample().reciprocal()
+            new_comp_mean_matrix = torch.zeros(batch_size, 1, n_components)
+            new_comp_std_matrix = torch.zeros(batch_size, 1, n_components)
+            obs_comp_matrix = torch.zeros(batch_size, seq_len, n_components)
+
+            for i in range(n_components // 2):
+                mean_lambda = torch.distributions.Normal(comp_mean_matrix[..., i], comp_std_matrix[..., i]).sample()
+                std_r = torch.distributions.Gamma(torch.ones(batch_size), comp_std_matrix[..., i].reciprocal()).sample()
+                new_comp_mean_matrix[..., 2*i:2*i+2] = torch.distributions.Normal(mean_lambda, std_r).sample(2).reshape(batch_size, 1, 2)
+
+                rate_inv_w = torch.distributions.Gamma(torch.ones(batch_size), comp_std_matrix[..., i]).sample().reciprocal()
+                new_comp_std_matrix[..., 2*i:2*i+2] = torch.distributions.Gamma(concentration_beta, rate_inv_w).sample(2).reshape(batch_size, 1, 2)
+
+                # obs_comp_matrix should contain a 1 in cell (batch_index, seq_index, component_index) if the seq_index is within [new_comp_mean_matrix[..., component_index] - new_comp_std_matrix[..., component_index], new_comp_mean_matrix[..., component_index] + new_comp_std_matrix[..., component_index]]
+                obs_comp_matrix[..., 2*i:2*i+2] = (positions.unsqueeze(-1) >= (new_comp_mean_matrix[..., 2*i:2*i+2] - new_comp_std_matrix[..., 2*i:2*i+2])) * (positions.unsqueeze(-1) <= (new_comp_mean_matrix[..., 2*i:2*i+2] + new_comp_std_matrix[..., 2*i:2*i+2]))
+
+            total_likelihood, comp_mean_matrix, comp_std_matrix = self._likelihood_estimation_step(positions, obs_comp_matrix, scores, attn_mask, alpha)
+            if verbose:
+                print(f"Average sample likelihood at component count {n_components}: {total_likelihood:.6f}")
+
+            if total_likelihood < previous_likelihood + tolerance or n_components > max_components:
+                break                
+
+        return comp_mean_matrix, comp_std_matrix
+
+
+    def forward(self, query: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+
+        batch_size, seq_len, hidden_size = query.shape
+        logit_scores = self.bahdanau_attention(query)
+        
+

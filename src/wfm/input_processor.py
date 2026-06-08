@@ -526,6 +526,10 @@ class BinaryTokenizer:
         """Decode binary integer codes back to text."""
         decoded_texts = [""] * len(binary_codes)
         powers_of_two = 2**np.arange(self.binary_dim*3, dtype = np.int64)[::-1]
+        
+        if isinstance(binary_codes[0][0], torch.Tensor):
+            powers_of_two = torch.from_numpy(powers_of_two)
+
         for i, encoding in enumerate(binary_codes):
             for code in encoding:
                 if isinstance(code, int):

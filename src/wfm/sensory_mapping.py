@@ -108,6 +108,30 @@ class SurfaceMappingTorch(nn.Module):
         return fourier_mappings
 
 
+class VectorMappingTorch(SurfaceMappingTorch):
+
+    def __init__(self, target_shape: Tuple[int, int, int], out_dim: int, dropout: float = 0.1, rnn_type: str = "GRU", device: torch.device = torch.device("cpu")):
+
+        super().__init__(target_shape, out_dim // 6, dropout, rnn_type, device)
+        self.output_size = out_dim
+
+    def forward(self, X: torch.Tensor):
+        """
+        Process input sequence to Fourier mappings.
+        """
+        while X.dim() < 5:
+            X = X.unsqueeze(0)
+        # X.shape = (batch_size, sequence_length, height, width, channels)
+
+        X_conv = self.conv(X)
+
+        rnn_mappings, _ = self.metamappings(X_conv)
+        vector_mappings = self.feature_mapping(rnn_mappings).reshape(X.shape[0], X.shape[1], self.output_size)
+        # vector_mappings.shape = (batch_size, sequence_length, out_dim)
+
+        return vector_mappings
+
+
 def create_peripheral_array_simple(X):
     """
     Transform array from (3,24,4,4,3) to (3,22,12,12,3) using numpy built-ins
